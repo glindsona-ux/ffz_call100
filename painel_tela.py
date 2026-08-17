@@ -1,51 +1,55 @@
 """
 Cog: Verificação de Tela / Call (!t / !tela / !tela @user) + Configuração (!config)
 -------------------------------------------------------------------------------------
-Usa LiveKit (https://livekit.io) em vez de um signaling_server próprio.
-Isso elimina o problema de domínio/DNS: o link final abre direto em
-https://meet.livekit.io, que é hospedado pelo próprio LiveKit.
+Usa a API REST da Zoom (Server-to-Server OAuth) pra criar reuniões instantâneas.
 
-Você NÃO precisa mais do app "ffz_signaling" (TYPE=site) no Discloud.
-Só precisa desse bot rodando + 3 variáveis de ambiente configuradas
-na aba "Variáveis" do app, criadas de graça em https://cloud.livekit.io:
+Diferente do LiveKit, a conta Zoom Basic (grátis) NÃO dá acesso à Dashboard API
+(quem entrou na sala em tempo real). Por isso não existe mais monitoramento
+automático de "sala vazia expira sozinha". No lugar disso tem um botão
+"🔄 Renovar sala" que apaga a reunião atual e cria outra na hora — é o mesmo
+truque de reiniciar a call pra ganhar mais 40 minutos, só que num clique.
 
-    LIVEKIT_URL          -> ex: wss://seuprojeto.livekit.cloud
-    LIVEKIT_API_KEY       -> gerado no painel do LiveKit Cloud
-    LIVEKIT_API_SECRET    -> gerado no painel do LiveKit Cloud
+Variáveis de ambiente necessárias (Server-to-Server OAuth app, grátis, em
+https://marketplace.zoom.us -> Build App):
+
+    ZOOM_ACCOUNT_ID
+    ZOOM_CLIENT_ID
+    ZOOM_CLIENT_SECRET
+
+Scope necessário no app: meeting:write:admin (e meeting:read:admin se quiser
+listar reuniões futuramente).
 
 !config -> só Administrator. Escolhe até 10 cargos autorizados a usar
            os comandos de análise/call.
 
-!t / !tela [@alguem] -> gera uma sala nova. Painel sem cor, sem emoji
-           no título, com separadores, e dois botões:
-             - "Entrar na Análise": gera um link PESSOAL (token com a
-               identidade de quem clicou) e responde só pra ela (ephemeral).
-             - "Copiar link": gera um link convidado (bearer, qualquer
-               um que tiver ele entra) e manda ele cru no chat, fácil
-               de repassar pra outro mediador.
+!t / !tela [@alguem] -> cria uma reunião Zoom instantânea. Painel sem cor,
+           sem emoji no título, com separadores, e dois itens:
+             - Botão de link "Entrar na call" -> abre o join_url da Zoom
+               direto (mesmo link pra qualquer um, a Zoom Basic não permite
+               link pessoal por participante sem fluxo de aprovação).
+             - Botão "🔄 Renovar sala" -> apaga a reunião atual e cria outra,
+               resetando os 40 minutos. Só quem criou a sala ou um mediador
+               autorizado pode renovar/encerrar.
 """
 
 import os
 import json
-import uuid
+import time
+import base64
 import sqlite3
 import asyncio
-from datetime import timedelta
 
+import aiohttp
 import discord
 from discord.ext import commands
 from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button, Separator
-from livekit import api
 
 DB_PATH = "ffz_data.db"
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
+ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
+ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
 
-TEMPO_EXPIRACAO = 300       # 5 minutos
-INTERVALO_CHECAGEM = 10     # a cada quantos segundos o bot checa se alguém entrou
-TTL_TOKEN = timedelta(hours=6)
 MAX_CARGOS = 10
 
 
@@ -55,12 +59,12 @@ def _criar_tabelas_sync():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tela_sessoes (
-            token TEXT PRIMARY KEY,
+            meeting_id TEXT PRIMARY KEY,
             guild_id INTEGER NOT NULL,
             adm_id INTEGER NOT NULL,
             alvo_id INTEGER,
             criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'pendente'
+            status TEXT DEFAULT 'ativa'
         )
     """)
     conn.execute("""
@@ -73,19 +77,19 @@ def _criar_tabelas_sync():
     conn.close()
 
 
-def _salvar_sessao_sync(sala: str, guild_id: int, adm_id: int, alvo_id: int = None):
+def _salvar_sessao_sync(meeting_id: str, guild_id: int, adm_id: int, alvo_id: int = None):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO tela_sessoes (token, guild_id, adm_id, alvo_id) VALUES (?, ?, ?, ?)",
-        (sala, guild_id, adm_id, alvo_id),
+        "INSERT INTO tela_sessoes (meeting_id, guild_id, adm_id, alvo_id) VALUES (?, ?, ?, ?)",
+        (meeting_id, guild_id, adm_id, alvo_id),
     )
     conn.commit()
     conn.close()
 
 
-def _atualizar_status_sync(sala: str, status: str):
+def _atualizar_status_sync(meeting_id: str, status: str):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE tela_sessoes SET status = ? WHERE token = ?", (status, sala))
+    conn.execute("UPDATE tela_sessoes SET status = ? WHERE meeting_id = ?", (status, meeting_id))
     conn.commit()
     conn.close()
 
@@ -110,37 +114,72 @@ def _buscar_cargos_sync(guild_id: int) -> list[int]:
     return json.loads(row[0]) if row else []
 
 
-# ---------- LiveKit: geração de link e checagem de participantes ----------
+# ---------- Zoom: token OAuth (Server-to-Server) e criação/exclusão de reunião ----------
 
-def _gerar_link_livekit(sala: str, identidade: str, nome: str) -> str:
-    token = (
-        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-        .with_identity(identidade)
-        .with_name(nome)
-        .with_grants(api.VideoGrants(
-            room_join=True,
-            room=sala,
-            can_publish=True,
-            can_subscribe=True,
-            can_publish_data=True,
-        ))
-        .with_ttl(TTL_TOKEN)
-        .to_jwt()
-    )
-    return f"https://meet.livekit.io/custom?liveKitUrl={LIVEKIT_URL}&token={token}"
+_token_cache = {"access_token": None, "expira_em": 0}
+_token_lock = asyncio.Lock()
 
 
-async def _tem_participante(sala: str) -> bool:
-    lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-    try:
-        resultado = await lkapi.room.list_rooms(api.ListRoomsRequest(names=[sala]))
-        if not resultado.rooms:
-            return False
-        return resultado.rooms[0].num_participants > 0
-    except Exception:
-        return False
-    finally:
-        await lkapi.aclose()
+async def _obter_token_zoom() -> str:
+    """Pega um access token válido, reaproveitando enquanto não expira (~1h)."""
+    async with _token_lock:
+        agora = time.time()
+        if _token_cache["access_token"] and agora < _token_cache["expira_em"] - 60:
+            return _token_cache["access_token"]
+
+        auth = base64.b64encode(f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}".encode()).decode()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://zoom.us/oauth/token",
+                headers={"Authorization": f"Basic {auth}"},
+                data={"grant_type": "account_credentials", "account_id": ZOOM_ACCOUNT_ID},
+            ) as resp:
+                dados = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Falha ao autenticar na Zoom: {dados}")
+
+        _token_cache["access_token"] = dados["access_token"]
+        _token_cache["expira_em"] = agora + dados.get("expires_in", 3600)
+        return _token_cache["access_token"]
+
+
+async def _criar_reuniao_zoom(topico: str) -> dict:
+    """Cria uma reunião instantânea (type=1) na conta host configurada (/users/me/meetings)."""
+    token = await _obter_token_zoom()
+    payload = {
+        "topic": topico,
+        "type": 1,  # instantânea
+        "settings": {
+            "join_before_host": True,
+            "waiting_room": False,
+            "host_video": True,
+            "participant_video": True,
+            "mute_upon_entry": True,
+        },
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.zoom.us/v2/users/me/meetings",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+        ) as resp:
+            dados = await resp.json()
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"Falha ao criar reunião Zoom: {dados}")
+            return dados
+
+
+async def _apagar_reuniao_zoom(meeting_id: str):
+    token = await _obter_token_zoom()
+    async with aiohttp.ClientSession() as session:
+        async with session.delete(
+            f"https://api.zoom.us/v2/meetings/{meeting_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as resp:
+            # 204 = sucesso, 404 = já não existe mais -> ambos ok pra nós
+            if resp.status not in (204, 404):
+                dados = await resp.text()
+                raise RuntimeError(f"Falha ao apagar reunião Zoom ({resp.status}): {dados}")
 
 
 # ---------- painel de configuração (!config) ----------
@@ -179,54 +218,94 @@ class ConfigCargosView(discord.ui.View):
 
 # ---------- painel V2 (!t / !tela) ----------
 
-class BotaoEntrar(Button):
-    def __init__(self, sala: str):
-        super().__init__(label="Entrar na Análise", style=discord.ButtonStyle.primary)
-        self.sala = sala
+class BotaoRenovar(Button):
+    def __init__(self, painel: "PainelTela"):
+        super().__init__(label="Renovar sala (novos 40min)", style=discord.ButtonStyle.secondary, emoji="🔄")
+        self.painel = painel
 
     async def callback(self, interaction: discord.Interaction):
-        link = await asyncio.to_thread(
-            _gerar_link_livekit, self.sala, str(interaction.user.id), interaction.user.display_name
-        )
-        view = discord.ui.View()
-        view.add_item(discord.ui.Button(label="Abrir análise", style=discord.ButtonStyle.link, url=link))
-        await interaction.response.send_message(
-            "🔗 Seu link pessoal (expira em 6h):", view=view, ephemeral=True
+        painel = self.painel
+        eh_dono = interaction.user.id == painel.adm_id
+        eh_mediador = await painel.cog._checar_mediador_membro(interaction.user)
+        if not (eh_dono or eh_mediador):
+            return await interaction.response.send_message(
+                "❌ Só quem criou a sala ou um mediador pode renovar.", ephemeral=True
+            )
+
+        await interaction.response.defer()
+
+        try:
+            await _apagar_reuniao_zoom(painel.meeting_id)
+        except Exception:
+            pass  # se já tinha caído/expirado do lado da Zoom, seguimos e criamos outra
+
+        try:
+            nova = await _criar_reuniao_zoom(painel.topico)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Erro ao criar nova reunião na Zoom: {e}", ephemeral=True)
+
+        await asyncio.to_thread(_atualizar_status_sync, painel.meeting_id, "renovada")
+        painel.meeting_id = str(nova["id"])
+        painel.join_url = nova["join_url"]
+        await asyncio.to_thread(
+            _salvar_sessao_sync, painel.meeting_id, painel.guild_id, painel.adm_id, painel.alvo_id
         )
 
+        painel._montar_conteudo(painel.alvo)
+        await interaction.message.edit(view=painel)
 
-class BotaoCopiarLink(Button):
-    def __init__(self, sala: str):
-        super().__init__(label="Copiar link", style=discord.ButtonStyle.secondary, emoji="🔗")
-        self.sala = sala
+
+class BotaoEncerrar(Button):
+    def __init__(self, painel: "PainelTela"):
+        super().__init__(label="Encerrar", style=discord.ButtonStyle.danger)
+        self.painel = painel
 
     async def callback(self, interaction: discord.Interaction):
-        identidade = f"convidado-{uuid.uuid4().hex[:8]}"
-        link = await asyncio.to_thread(_gerar_link_livekit, self.sala, identidade, "Convidado")
-        # manda o link cru, sem embed nem formatação, fácil de segurar-e-copiar no celular
-        await interaction.response.send_message(link)
+        painel = self.painel
+        eh_dono = interaction.user.id == painel.adm_id
+        eh_mediador = await painel.cog._checar_mediador_membro(interaction.user)
+        if not (eh_dono or eh_mediador):
+            return await interaction.response.send_message(
+                "❌ Só quem criou a sala ou um mediador pode encerrar.", ephemeral=True
+            )
+
+        await interaction.response.defer()
+        try:
+            await _apagar_reuniao_zoom(painel.meeting_id)
+        except Exception:
+            pass
+        await asyncio.to_thread(_atualizar_status_sync, painel.meeting_id, "encerrada")
+
+        painel._montar_conteudo(painel.alvo, encerrada=True)
+        await interaction.message.edit(view=painel)
 
 
 class PainelTela(LayoutView):
-    def __init__(self, sala: str, alvo: discord.Member = None):
+    def __init__(self, cog: "Tela", meeting_id: str, join_url: str, topico: str,
+                 guild_id: int, adm_id: int, alvo: discord.Member = None):
         super().__init__(timeout=None)
-        self.sala = sala
-        self.message: discord.Message | None = None
+        self.cog = cog
+        self.meeting_id = meeting_id
+        self.join_url = join_url
+        self.topico = topico
+        self.guild_id = guild_id
+        self.adm_id = adm_id
+        self.alvo = alvo
+        self.alvo_id = alvo.id if alvo else None
 
         self.container = Container()  # sem accent_color -> sem barra colorida
         self._montar_conteudo(alvo)
         self.add_item(self.container)
 
-    def _montar_conteudo(self, alvo, expirado=False):
+    def _montar_conteudo(self, alvo, encerrada=False):
         self.container.clear_items()
+        self.clear_items()
 
-        if expirado:
+        if encerrada:
             self.container.add_item(TextDisplay("## Verificação de Tela"))
             self.container.add_item(Separator())
-            self.container.add_item(TextDisplay(
-                "**Status:** ⏱️ sala expirada (ninguém entrou em 5 min)\n\n"
-                "Use `!t` de novo pra abrir uma nova sala."
-            ))
+            self.container.add_item(TextDisplay("**Status:** 🔴 sala encerrada."))
+            self.add_item(self.container)
             return
 
         alvo_linha = f"**Alvo:** {alvo.mention}" if alvo else "**Tipo:** sala aberta"
@@ -234,17 +313,20 @@ class PainelTela(LayoutView):
         self.container.add_item(Separator())
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"**Status:** ⏳ aguardando entrada (expira em 5 min se ninguém entrar)"
+            f"**Status:** 🟢 sala ativa (Zoom grátis corta em ~40min — use *Renovar* se cair)"
         ))
         self.container.add_item(Separator())
 
         row = ActionRow()
-        row.add_item(BotaoEntrar(self.sala))
-        row.add_item(BotaoCopiarLink(self.sala))
+        row.add_item(Button(label="Entrar na call", style=discord.ButtonStyle.link, url=self.join_url))
         self.container.add_item(row)
 
-    def marcar_expirada(self):
-        self._montar_conteudo(alvo=None, expirado=True)
+        row2 = ActionRow()
+        row2.add_item(BotaoRenovar(self))
+        row2.add_item(BotaoEncerrar(self))
+        self.container.add_item(row2)
+
+        self.add_item(self.container)
 
 
 # ---------- cog ----------
@@ -255,37 +337,22 @@ class Tela(commands.Cog):
 
     async def cog_load(self):
         await asyncio.to_thread(_criar_tabelas_sync)
-        if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
-            print("⚠️  LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET não configurados nas Variáveis do app!")
+        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET):
+            print("⚠️  ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET não configurados nas Variáveis do app!")
 
     async def _checar_mediador(self, ctx: commands.Context) -> bool:
-        if ctx.author.guild_permissions.administrator:
+        return await self._checar_mediador_membro(ctx.author)
+
+    async def _checar_mediador_membro(self, membro: discord.Member) -> bool:
+        if membro.guild_permissions.administrator:
             return True
 
-        cargos_autorizados = await asyncio.to_thread(_buscar_cargos_sync, ctx.guild.id)
+        cargos_autorizados = await asyncio.to_thread(_buscar_cargos_sync, membro.guild.id)
         if not cargos_autorizados:
-            return ctx.author.guild_permissions.manage_guild
+            return membro.guild_permissions.manage_guild
 
-        ids_do_autor = {r.id for r in ctx.author.roles}
+        ids_do_autor = {r.id for r in membro.roles}
         return bool(ids_do_autor & set(cargos_autorizados))
-
-    async def _monitorar_sessao(self, painel: PainelTela):
-        decorrido = 0
-        while decorrido < TEMPO_EXPIRACAO:
-            await asyncio.sleep(INTERVALO_CHECAGEM)
-            decorrido += INTERVALO_CHECAGEM
-
-            if await _tem_participante(painel.sala):
-                await asyncio.to_thread(_atualizar_status_sync, painel.sala, "ativa")
-                return
-
-        await asyncio.to_thread(_atualizar_status_sync, painel.sala, "expirada")
-        painel.marcar_expirada()
-        if painel.message:
-            try:
-                await painel.message.edit(view=painel)
-            except discord.HTTPException:
-                pass
 
     @commands.command(name="config", aliases=["configurar"])
     @commands.has_permissions(administrator=True)
@@ -305,10 +372,10 @@ class Tela(commands.Cog):
 
     @commands.command(name="tela", aliases=["t"])
     async def tela(self, ctx: commands.Context, alvo: discord.Member = None):
-        if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET):
             return await ctx.send(
-                "❌ O bot ainda não tem as variáveis do LiveKit configuradas "
-                "(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET).", delete_after=10
+                "❌ O bot ainda não tem as variáveis da Zoom configuradas "
+                "(ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET).", delete_after=10
             )
 
         if not await self._checar_mediador(ctx):
@@ -322,17 +389,24 @@ class Tela(commands.Cog):
         if alvo is not None and alvo.bot:
             return await ctx.send("❌ Não dá pra verificar um bot.", delete_after=8)
 
-        sala = f"ffz-{uuid.uuid4().hex[:12]}"
+        topico = f"Verificação de Tela - {alvo.display_name}" if alvo else f"Verificação de Tela - {ctx.guild.name}"
+
+        async with ctx.typing():
+            try:
+                reuniao = await _criar_reuniao_zoom(topico)
+            except Exception as e:
+                return await ctx.send(f"❌ Erro ao criar reunião na Zoom: {e}", delete_after=15)
+
+        meeting_id = str(reuniao["id"])
+        join_url = reuniao["join_url"]
 
         await asyncio.to_thread(
-            _salvar_sessao_sync, sala, ctx.guild.id, ctx.author.id,
+            _salvar_sessao_sync, meeting_id, ctx.guild.id, ctx.author.id,
             alvo.id if alvo else None,
         )
 
-        painel = PainelTela(sala, alvo)
-        painel.message = await ctx.send(view=painel)
-
-        asyncio.create_task(self._monitorar_sessao(painel))
+        painel = PainelTela(self, meeting_id, join_url, topico, ctx.guild.id, ctx.author.id, alvo)
+        await ctx.send(view=painel)
 
 
 async def setup(bot: commands.Bot):
