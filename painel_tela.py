@@ -1,25 +1,28 @@
 """
-Cog: Verificação de Tela (!t / !tela / !tela @user) + Configuração (!config)
------------------------------------------------------------------------------
-!config  -> só quem tem Administrator no server. Abre um seletor de cargos
-            (até 10) que ficam autorizados a usar !t / !tela dali em diante.
-            Enquanto ninguém configurar nada, cai no fallback antigo
-            (manage_guild), pra não travar quem já estava usando.
+Cog: Verificação de Tela / Call (!t / !tela / !tela @user) + Configuração (!config)
+-------------------------------------------------------------------------------------
+Usa LiveKit (https://livekit.io) em vez de um signaling_server próprio.
+Isso elimina o problema de domínio/DNS: o link final abre direto em
+https://meet.livekit.io, que é hospedado pelo próprio LiveKit.
 
-!t / !tela [@alguem] -> só quem tem um dos cargos configurados (ou admin)
-            consegue usar. Mostra um painel V2 sem cor de card, sem emoji
-            no título, com separadores, e dois botões:
-              - "Entrar na Análise" (link direto)
-              - "Copiar link" (o bot manda o link cru no chat, sem embed,
-                fácil de copiar no celular)
-            A sala expira sozinha em 5 minutos se ninguém entrar.
+Você NÃO precisa mais do app "ffz_signaling" (TYPE=site) no Discloud.
+Só precisa desse bot rodando + 3 variáveis de ambiente configuradas
+na aba "Variáveis" do app, criadas de graça em https://cloud.livekit.io:
 
-Como o bot no Discloud não tem porta externa pra RECEBER avisos, quem
-checa se alguém entrou é o próprio bot: a cada 10s ele PERGUNTA pro
-signaling_server (GET /status/<token>) se já tem gente na call.
+    LIVEKIT_URL          -> ex: wss://seuprojeto.livekit.cloud
+    LIVEKIT_API_KEY       -> gerado no painel do LiveKit Cloud
+    LIVEKIT_API_SECRET    -> gerado no painel do LiveKit Cloud
 
-Precisa do signaling_server.py rodando (TYPE=site no Discloud) e da
-env SCREENCHECK_BASE_URL apontando pra URL pública dele.
+!config -> só Administrator. Escolhe até 10 cargos autorizados a usar
+           os comandos de análise/call.
+
+!t / !tela [@alguem] -> gera uma sala nova. Painel sem cor, sem emoji
+           no título, com separadores, e dois botões:
+             - "Entrar na Análise": gera um link PESSOAL (token com a
+               identidade de quem clicou) e responde só pra ela (ephemeral).
+             - "Copiar link": gera um link convidado (bearer, qualquer
+               um que tiver ele entra) e manda ele cru no chat, fácil
+               de repassar pra outro mediador.
 """
 
 import os
@@ -27,15 +30,22 @@ import json
 import uuid
 import sqlite3
 import asyncio
-import urllib.request
+from datetime import timedelta
+
 import discord
 from discord.ext import commands
 from discord.ui import LayoutView, Container, TextDisplay, ActionRow, Button, Separator
+from livekit import api
 
-DB_PATH = "ffz_data.db"  # ajuste pro caminho/handle real do seu database.py
-BASE_URL = os.getenv("SCREENCHECK_BASE_URL", "https://suaapp.discloud.app")
-TEMPO_EXPIRACAO = 300  # 5 minutos
-INTERVALO_CHECAGEM = 10  # a cada quantos segundos o bot pergunta pro signaling_server
+DB_PATH = "ffz_data.db"
+
+LIVEKIT_URL = os.getenv("LIVEKIT_URL")
+LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+
+TEMPO_EXPIRACAO = 300       # 5 minutos
+INTERVALO_CHECAGEM = 10     # a cada quantos segundos o bot checa se alguém entrou
+TTL_TOKEN = timedelta(hours=6)
 MAX_CARGOS = 10
 
 
@@ -63,32 +73,21 @@ def _criar_tabelas_sync():
     conn.close()
 
 
-def _salvar_sessao_sync(token: str, guild_id: int, adm_id: int, alvo_id: int = None):
+def _salvar_sessao_sync(sala: str, guild_id: int, adm_id: int, alvo_id: int = None):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO tela_sessoes (token, guild_id, adm_id, alvo_id) VALUES (?, ?, ?, ?)",
-        (token, guild_id, adm_id, alvo_id),
+        (sala, guild_id, adm_id, alvo_id),
     )
     conn.commit()
     conn.close()
 
 
-def _atualizar_status_sync(token: str, status: str):
+def _atualizar_status_sync(sala: str, status: str):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE tela_sessoes SET status = ? WHERE token = ?", (status, token))
+    conn.execute("UPDATE tela_sessoes SET status = ? WHERE token = ?", (status, sala))
     conn.commit()
     conn.close()
-
-
-def _checar_status_sync(token: str) -> bool:
-    """Pergunta pro signaling_server se já tem alguém na call. Roda em thread
-    porque urllib é bloqueante."""
-    try:
-        with urllib.request.urlopen(f"{BASE_URL}/status/{token}", timeout=5) as resp:
-            dados = json.loads(resp.read().decode())
-            return bool(dados.get("joined"))
-    except Exception:
-        return False
 
 
 def _salvar_config_sync(guild_id: int, cargos_ids: list[int]):
@@ -109,6 +108,39 @@ def _buscar_cargos_sync(guild_id: int) -> list[int]:
     ).fetchone()
     conn.close()
     return json.loads(row[0]) if row else []
+
+
+# ---------- LiveKit: geração de link e checagem de participantes ----------
+
+def _gerar_link_livekit(sala: str, identidade: str, nome: str) -> str:
+    token = (
+        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(identidade)
+        .with_name(nome)
+        .with_grants(api.VideoGrants(
+            room_join=True,
+            room=sala,
+            can_publish=True,
+            can_subscribe=True,
+            can_publish_data=True,
+        ))
+        .with_ttl(TTL_TOKEN)
+        .to_jwt()
+    )
+    return f"https://meet.livekit.io/custom?liveKitUrl={LIVEKIT_URL}&token={token}"
+
+
+async def _tem_participante(sala: str) -> bool:
+    lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+    try:
+        resultado = await lkapi.room.list_rooms(api.ListRoomsRequest(names=[sala]))
+        if not resultado.rooms:
+            return False
+        return resultado.rooms[0].num_participants > 0
+    except Exception:
+        return False
+    finally:
+        await lkapi.aclose()
 
 
 # ---------- painel de configuração (!config) ----------
@@ -147,21 +179,38 @@ class ConfigCargosView(discord.ui.View):
 
 # ---------- painel V2 (!t / !tela) ----------
 
-class BotaoCopiarLink(Button):
-    def __init__(self, watch_url: str):
-        super().__init__(label="Copiar link", style=discord.ButtonStyle.secondary, emoji="🔗")
-        self.watch_url = watch_url
+class BotaoEntrar(Button):
+    def __init__(self, sala: str):
+        super().__init__(label="Entrar na Análise", style=discord.ButtonStyle.primary)
+        self.sala = sala
 
     async def callback(self, interaction: discord.Interaction):
+        link = await asyncio.to_thread(
+            _gerar_link_livekit, self.sala, str(interaction.user.id), interaction.user.display_name
+        )
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Abrir análise", style=discord.ButtonStyle.link, url=link))
+        await interaction.response.send_message(
+            "🔗 Seu link pessoal (expira em 6h):", view=view, ephemeral=True
+        )
+
+
+class BotaoCopiarLink(Button):
+    def __init__(self, sala: str):
+        super().__init__(label="Copiar link", style=discord.ButtonStyle.secondary, emoji="🔗")
+        self.sala = sala
+
+    async def callback(self, interaction: discord.Interaction):
+        identidade = f"convidado-{uuid.uuid4().hex[:8]}"
+        link = await asyncio.to_thread(_gerar_link_livekit, self.sala, identidade, "Convidado")
         # manda o link cru, sem embed nem formatação, fácil de segurar-e-copiar no celular
-        await interaction.response.send_message(self.watch_url)
+        await interaction.response.send_message(link)
 
 
 class PainelTela(LayoutView):
-    def __init__(self, token: str, watch_url: str, alvo: discord.Member = None):
-        super().__init__(timeout=None)  # quem controla a expiração é a task de polling, não o discord.py
-        self.token = token
-        self.watch_url = watch_url
+    def __init__(self, sala: str, alvo: discord.Member = None):
+        super().__init__(timeout=None)
+        self.sala = sala
         self.message: discord.Message | None = None
 
         self.container = Container()  # sem accent_color -> sem barra colorida
@@ -190,12 +239,8 @@ class PainelTela(LayoutView):
         self.container.add_item(Separator())
 
         row = ActionRow()
-        row.add_item(Button(
-            label="Entrar na Análise",
-            style=discord.ButtonStyle.link,
-            url=self.watch_url,
-        ))
-        row.add_item(BotaoCopiarLink(self.watch_url))
+        row.add_item(BotaoEntrar(self.sala))
+        row.add_item(BotaoCopiarLink(self.sala))
         self.container.add_item(row)
 
     def marcar_expirada(self):
@@ -210,36 +255,31 @@ class Tela(commands.Cog):
 
     async def cog_load(self):
         await asyncio.to_thread(_criar_tabelas_sync)
+        if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+            print("⚠️  LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET não configurados nas Variáveis do app!")
 
     async def _checar_mediador(self, ctx: commands.Context) -> bool:
         if ctx.author.guild_permissions.administrator:
             return True
 
         cargos_autorizados = await asyncio.to_thread(_buscar_cargos_sync, ctx.guild.id)
-
         if not cargos_autorizados:
-            # ninguém configurou !config ainda nesse server -> mantém o
-            # comportamento antigo, pra não travar quem já estava usando
             return ctx.author.guild_permissions.manage_guild
 
         ids_do_autor = {r.id for r in ctx.author.roles}
         return bool(ids_do_autor & set(cargos_autorizados))
 
     async def _monitorar_sessao(self, painel: PainelTela):
-        """Fica perguntando pro signaling_server, de INTERVALO_CHECAGEM em
-        INTERVALO_CHECAGEM segundos, se alguém entrou. Se ninguém entrar em
-        TEMPO_EXPIRACAO segundos, edita o painel pra 'expirada'."""
         decorrido = 0
         while decorrido < TEMPO_EXPIRACAO:
             await asyncio.sleep(INTERVALO_CHECAGEM)
             decorrido += INTERVALO_CHECAGEM
 
-            entrou = await asyncio.to_thread(_checar_status_sync, painel.token)
-            if entrou:
-                await asyncio.to_thread(_atualizar_status_sync, painel.token, "ativa")
-                return  # sessão em uso, não expira mais
+            if await _tem_participante(painel.sala):
+                await asyncio.to_thread(_atualizar_status_sync, painel.sala, "ativa")
+                return
 
-        await asyncio.to_thread(_atualizar_status_sync, painel.token, "expirada")
+        await asyncio.to_thread(_atualizar_status_sync, painel.sala, "expirada")
         painel.marcar_expirada()
         if painel.message:
             try:
@@ -265,10 +305,15 @@ class Tela(commands.Cog):
 
     @commands.command(name="tela", aliases=["t"])
     async def tela(self, ctx: commands.Context, alvo: discord.Member = None):
+        if not (LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET):
+            return await ctx.send(
+                "❌ O bot ainda não tem as variáveis do LiveKit configuradas "
+                "(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET).", delete_after=10
+            )
+
         if not await self._checar_mediador(ctx):
             return await ctx.send("❌ Você não tem permissão pra usar esse comando.", delete_after=8)
 
-        # Se não passou @menção, tenta pegar o autor da mensagem respondida.
         if alvo is None and ctx.message.reference:
             msg_respondida = ctx.message.reference.resolved
             if isinstance(msg_respondida, discord.Message) and isinstance(msg_respondida.author, discord.Member):
@@ -277,15 +322,14 @@ class Tela(commands.Cog):
         if alvo is not None and alvo.bot:
             return await ctx.send("❌ Não dá pra verificar um bot.", delete_after=8)
 
-        token = uuid.uuid4().hex[:16]
-        watch_url = f"{BASE_URL}/watch/{token}"
+        sala = f"ffz-{uuid.uuid4().hex[:12]}"
 
         await asyncio.to_thread(
-            _salvar_sessao_sync, token, ctx.guild.id, ctx.author.id,
+            _salvar_sessao_sync, sala, ctx.guild.id, ctx.author.id,
             alvo.id if alvo else None,
         )
 
-        painel = PainelTela(token, watch_url, alvo)
+        painel = PainelTela(sala, alvo)
         painel.message = await ctx.send(view=painel)
 
         asyncio.create_task(self._monitorar_sessao(painel))
