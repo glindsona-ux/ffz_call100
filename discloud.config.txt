@@ -1,0 +1,6 @@
+ID=ffztela
+TYPE=site
+MAIN=signaling_server.py
+RAM=512
+VERSION=latest
+AUTORESTART=true
