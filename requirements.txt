@@ -1,1 +1,1 @@
-aiohttp
+Discord.py
