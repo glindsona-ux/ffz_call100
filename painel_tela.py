@@ -49,8 +49,12 @@ DB_PATH = "ffz_data.db"
 ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
+# Apps Server-to-Server NÃO podem usar o atalho "me" -> precisa do e-mail
+# (ou userId) real da conta Zoom que vai hospedar as reuniões.
+ZOOM_USER_ID = os.getenv("ZOOM_USER_ID")
 
 MAX_CARGOS = 10
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
 # ---------- camada de dados (sqlite síncrono, rodado em thread) ----------
@@ -128,7 +132,7 @@ async def _obter_token_zoom() -> str:
             return _token_cache["access_token"]
 
         auth = base64.b64encode(f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}".encode()).decode()
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
             async with session.post(
                 "https://zoom.us/oauth/token",
                 headers={"Authorization": f"Basic {auth}"},
@@ -144,7 +148,12 @@ async def _obter_token_zoom() -> str:
 
 
 async def _criar_reuniao_zoom(topico: str) -> dict:
-    """Cria uma reunião instantânea (type=1) na conta host configurada (/users/me/meetings)."""
+    """Cria uma reunião instantânea (type=1) na conta host configurada."""
+    if not ZOOM_USER_ID:
+        raise RuntimeError(
+            "ZOOM_USER_ID não configurado (precisa ser o e-mail da conta Zoom "
+            "que vai hospedar as reuniões — apps Server-to-Server não usam 'me')."
+        )
     token = await _obter_token_zoom()
     payload = {
         "topic": topico,
@@ -157,21 +166,21 @@ async def _criar_reuniao_zoom(topico: str) -> dict:
             "mute_upon_entry": True,
         },
     }
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         async with session.post(
-            "https://api.zoom.us/v2/users/me/meetings",
+            f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}/meetings",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=payload,
         ) as resp:
             dados = await resp.json()
             if resp.status not in (200, 201):
-                raise RuntimeError(f"Falha ao criar reunião Zoom: {dados}")
+                raise RuntimeError(f"Falha ao criar reunião Zoom ({resp.status}): {dados}")
             return dados
 
 
 async def _apagar_reuniao_zoom(meeting_id: str):
     token = await _obter_token_zoom()
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
         async with session.delete(
             f"https://api.zoom.us/v2/meetings/{meeting_id}",
             headers={"Authorization": f"Bearer {token}"},
@@ -337,8 +346,8 @@ class Tela(commands.Cog):
 
     async def cog_load(self):
         await asyncio.to_thread(_criar_tabelas_sync)
-        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET):
-            print("⚠️  ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET não configurados nas Variáveis do app!")
+        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET and ZOOM_USER_ID):
+            print("⚠️  ZOOM_ACCOUNT_ID / ZOOM_CLIENT_ID / ZOOM_CLIENT_SECRET / ZOOM_USER_ID não configurados nas Variáveis do app!")
 
     async def _checar_mediador(self, ctx: commands.Context) -> bool:
         return await self._checar_mediador_membro(ctx.author)
@@ -372,10 +381,10 @@ class Tela(commands.Cog):
 
     @commands.command(name="tela", aliases=["t"])
     async def tela(self, ctx: commands.Context, alvo: discord.Member = None):
-        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET):
+        if not (ZOOM_ACCOUNT_ID and ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET and ZOOM_USER_ID):
             return await ctx.send(
                 "❌ O bot ainda não tem as variáveis da Zoom configuradas "
-                "(ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET).", delete_after=10
+                "(ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET, ZOOM_USER_ID).", delete_after=10
             )
 
         if not await self._checar_mediador(ctx):
