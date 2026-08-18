@@ -61,6 +61,13 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 def _criar_tabelas_sync():
     conn = sqlite3.connect(DB_PATH)
+
+    # Migração: se a tabela tela_sessoes existir no formato antigo (LiveKit,
+    # coluna "token"), apaga e recria no formato novo (Zoom, "meeting_id").
+    colunas = [row[1] for row in conn.execute("PRAGMA table_info(tela_sessoes)").fetchall()]
+    if colunas and "meeting_id" not in colunas:
+        conn.execute("DROP TABLE tela_sessoes")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tela_sessoes (
             meeting_id TEXT PRIMARY KEY,
