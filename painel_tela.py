@@ -536,10 +536,11 @@ class Tela(commands.Cog):
 
                 cor = await _cor_da_guild(ctx.guild.id)
                 painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor)
+                await ctx.send(view=painel)
             except Exception as e:
-                return await ctx.send(f"❌ Erro ao criar sala: `{e}`", delete_after=20)
-
-        await ctx.send(view=painel)
+                import traceback
+                traceback.print_exc()
+                return await ctx.send(f"❌ Erro ao criar sala: `{type(e).__name__}: {e}`", delete_after=30)
 
 
 async def setup(bot: commands.Bot):
