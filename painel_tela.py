@@ -313,10 +313,10 @@ class ModalCodigoEspectador(Modal, title="Assistir Análise"):
 class PainelEspectador(LayoutView):
     """Painel fixo, sem estado próprio -> pode ser reregistrado com bot.add_view()."""
 
-    def __init__(self, cog: "Tela"):
+    def __init__(self, cog: "Tela", cor: int = COR_PADRAO):
         super().__init__(timeout=None)
         self.cog = cog
-        container = Container(accent_color=discord.Color.blurple())
+        container = Container(accent_color=discord.Color(cor))
         container.add_item(TextDisplay("## 📺 Assistir Análise"))
         container.add_item(Separator())
         container.add_item(TextDisplay(
@@ -334,7 +334,7 @@ class PainelEspectador(LayoutView):
 class BotaoEntrarEspectador(Button):
     def __init__(self, cog: "Tela"):
         super().__init__(
-            label="Entrar na Análise", style=discord.ButtonStyle.primary,
+            label="Entrar na Análise", style=discord.ButtonStyle.secondary,
             custom_id="ffz_call:entrar_espectador",
         )
         self.cog = cog
@@ -407,8 +407,7 @@ class PainelTela(LayoutView):
         self.cor = cor
 
         self.container = Container(accent_color=discord.Color(cor))
-        self._montar_conteudo()
-        self.add_item(self.container)
+        self._montar_conteudo()  # já adiciona self.container à view (necessário pro re-render no encerrar)
 
     def _montar_conteudo(self, encerrada=False):
         self.container.clear_items()
@@ -465,7 +464,8 @@ class Tela(commands.Cog):
 
     async def publicar_painel_espectador(self, canal: discord.TextChannel):
         cfg = await asyncio.to_thread(_buscar_config_sync, canal.guild.id)
-        painel = PainelEspectador(self)
+        cor = cfg["cor"] if cfg["cor"] is not None else COR_PADRAO
+        painel = PainelEspectador(self, cor=cor)
 
         msg = None
         if cfg["painel_msg_id"]:
