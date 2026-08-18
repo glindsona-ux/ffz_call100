@@ -403,18 +403,19 @@ class Tela(commands.Cog):
         async with ctx.typing():
             try:
                 reuniao = await _criar_reuniao_zoom(topico)
+
+                meeting_id = str(reuniao["id"])
+                join_url = reuniao["join_url"]
+
+                await asyncio.to_thread(
+                    _salvar_sessao_sync, meeting_id, ctx.guild.id, ctx.author.id,
+                    alvo.id if alvo else None,
+                )
+
+                painel = PainelTela(self, meeting_id, join_url, topico, ctx.guild.id, ctx.author.id, alvo)
             except Exception as e:
-                return await ctx.send(f"❌ Erro ao criar reunião na Zoom: {e}", delete_after=15)
+                return await ctx.send(f"❌ Erro ao criar sala: `{e}`", delete_after=20)
 
-        meeting_id = str(reuniao["id"])
-        join_url = reuniao["join_url"]
-
-        await asyncio.to_thread(
-            _salvar_sessao_sync, meeting_id, ctx.guild.id, ctx.author.id,
-            alvo.id if alvo else None,
-        )
-
-        painel = PainelTela(self, meeting_id, join_url, topico, ctx.guild.id, ctx.author.id, alvo)
         await ctx.send(view=painel)
 
 
