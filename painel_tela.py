@@ -428,7 +428,13 @@ class BotaoGerarUrl(Button):
         # como no Jitsi, então o texto muda conforme o papel, mas o link é o
         # mesmo pra todo mundo que clicar
         if eh_alvo:
-            texto = "Entre e **compartilhe sua tela** assim que possível:"
+            texto = (
+                "Entre e **compartilhe sua tela** assim que possível:\n"
+                "-# ⚠️ Se estiver no **celular**, abra o link pelo **app do Google Meet** "
+                "(baixe na App Store/Play Store se ainda não tiver). No **iPhone**, "
+                "compartilhamento de tela **não funciona pelo navegador/Safari** — é "
+                "limitação do próprio iOS, só o app resolve."
+            )
         elif eh_mediador:
             texto = f"{EMOJIS['escudo']} Entre para acompanhar a análise como mediador:"
         else:
@@ -566,7 +572,9 @@ class PainelTela(LayoutView):
                        else "**Tipo de sessão:** Sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"-# A call já está ativa no Google Meet. Use os botões abaixo para gerenciar o acesso."
+            f"-# A call já está ativa no Google Meet. Use os botões abaixo para gerenciar o acesso.\n"
+            f"-# {EMOJIS['aviso']} Pelo celular, abra sempre no **app do Google Meet** — no "
+            f"iPhone, compartilhar tela **não funciona pelo Safari/navegador**, é limitação do iOS."
         ))
         self.container.add_item(Separator())
 
