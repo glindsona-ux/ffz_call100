@@ -1,33 +1,48 @@
 """
-Integração com Google Meet (via Google Calendar API)
------------------------------------------------------
-O Google Meet não tem como o Jitsi um jeito de "inventar" uma sala só montando
-uma URL. Pra gerar um link de Meet de verdade, a gente precisa criar um evento
-de verdade no Google Calendar de uma conta Google (a sua) pedindo pra anexar
-uma videochamada (conferenceData). O Google devolve o link do Meet daquele
-evento.
+Integração com Google Meet (via Google Meet API — recurso "spaces")
+-----------------------------------------------------------------------
+Antes esse arquivo criava um evento no Google Calendar com uma
+videochamada anexada (conferenceData). Isso funciona, mas a Calendar API
+não deixa configurar o "accessType" da sala -- então toda call caía com
+sala de espera (quem não tava convidado no evento precisava ser admitido
+manualmente por um organizador). É exatamente o que você via na tela de
+"Aguarde até que um organizador da reunião adicione você à chamada".
+
+Agora a gente cria a sala direto pela Meet API (recurso `spaces`), que
+permite marcar accessType="OPEN" -- ou seja, qualquer pessoa com o link
+entra direto, sem sala de espera e sem precisar de aprovação. Isso
+funciona em conta Google pessoal também (não precisa de Workspace).
 
 Setup necessário (uma vez só, feito por você, fora do bot):
-    1. Rodar setup_oauth.py na sua máquina (com navegador) pra autorizar o
-       bot a usar SUA conta Google. Isso gera um "refresh token".
-    2. Colocar 3 variáveis de ambiente no Discloud:
-       GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-       (as duas primeiras vêm do Google Cloud Console, a terceira do passo 1)
+    1. No Google Cloud Console, em "APIs e serviços" > "Biblioteca",
+       ativar a "Google Meet API" pro projeto (além da Calendar API, se
+       ainda quiser deixar ela habilitada).
+    2. Rodar setup_oauth.py de novo (ele agora pede a permissão
+       "meetings.space.created" em vez de "calendar.events") -- isso gera
+       um refresh token NOVO, porque o token antigo só tinha permissão
+       pra Calendar e não serve pra Meet API.
+    3. Atualizar a variável de ambiente GOOGLE_REFRESH_TOKEN no Discloud
+       com esse token novo. GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET
+       continuam os mesmos (é o mesmo projeto/app no Cloud Console).
 
 Com conta Google comum (não-Workspace): reuniões com 3+ participantes caem
 sozinhas em 60 minutos (aviso aos 55min). É a limitação do plano gratuito do
-Google, não tem contorno via código — só pagando Workspace.
+Google, não tem contorno via código — só pagando Workspace. Isso vale tanto
+pra sala criada via Calendar quanto via Meet API, então não muda com essa
+mudança.
 """
 
 import os
 import asyncio
-import datetime
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+# escopo da Meet API -- "cria, edita e vê info das salas criadas pelo app".
+# Precisa ser autorizado de novo com setup_oauth.py (o token antigo, que só
+# tinha calendar.events, não serve mais).
+SCOPES = ["https://www.googleapis.com/auth/meetings.space.created"]
 
 _service = None  # cache do client autenticado, montado na primeira chamada
 
@@ -56,53 +71,43 @@ def _get_service_sync():
                 "Rode setup_oauth.py e configure elas no Discloud."
             )
         creds = _montar_credenciais()
-        _service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        _service = build("meet", "v2", credentials=creds, cache_discovery=False)
     return _service
 
 
 def _criar_reuniao_sync(titulo: str, minutos_duracao: int = 60) -> tuple[str, str]:
-    """Cria o evento no Calendar com uma videochamada do Meet anexada.
-    Retorna (link_do_meet, id_do_evento)."""
+    """Cria uma sala (space) na Meet API com acesso aberto (sem sala de
+    espera). O parâmetro `titulo` é mantido só por compatibilidade com quem
+    chama essa função -- a Meet API não tem campo de título pra uma sala
+    avulsa (isso só existe quando a sala nasce de um evento do Calendar).
+    Retorna (link_do_meet, nome_do_espaco), onde nome_do_espaco é tipo
+    "spaces/abc123", usado depois pra encerrar a call."""
     service = _get_service_sync()
 
-    agora = datetime.datetime.utcnow()
-    inicio = agora.isoformat() + "Z"
-    fim = (agora + datetime.timedelta(minutes=minutos_duracao)).isoformat() + "Z"
+    espaco_criado = service.spaces().create(body={
+        "config": {
+            "accessType": "OPEN",
+            "entryPointAccess": "ALL",
+        }
+    }).execute()
 
-    corpo_evento = {
-        "summary": titulo,
-        "start": {"dateTime": inicio, "timeZone": "UTC"},
-        "end": {"dateTime": fim, "timeZone": "UTC"},
-        # request_id só precisa ser único por chamada; usamos algo simples
-        "conferenceData": {
-            "createRequest": {
-                "requestId": f"ffz-{agora.timestamp()}",
-                "conferenceSolutionKey": {"type": "hangoutsMeet"},
-            }
-        },
-        # evento "privado" -- não convida ninguém, só existe pra gerar o link
-        "visibility": "private",
-        "guestsCanInviteOthers": False,
-    }
-
-    evento_criado = service.events().insert(
-        calendarId="primary",
-        body=corpo_evento,
-        conferenceDataVersion=1,  # obrigatório pro Google realmente gerar o Meet
-    ).execute()
-
-    link = evento_criado.get("hangoutLink")
-    if not link:
-        raise RuntimeError("O Google não devolveu um link de Meet pra esse evento.")
-    return link, evento_criado["id"]
+    link = espaco_criado.get("meetingUri")
+    nome_espaco = espaco_criado.get("name")
+    if not link or not nome_espaco:
+        raise RuntimeError("O Google não devolveu um link de Meet pra essa sala.")
+    return link, nome_espaco
 
 
-def _excluir_reuniao_sync(evento_id: str):
+def _excluir_reuniao_sync(nome_espaco: str):
+    """Encerra a conferência ativa da sala (se tiver alguém nela) pra tirar
+    todo mundo. A sala em si (o link) continua existindo na Meet API -- só
+    não tem mais ninguém dentro. Não precisa "deletar" a sala como fazia
+    com o evento do Calendar."""
     service = _get_service_sync()
     try:
-        service.events().delete(calendarId="primary", eventId=evento_id).execute()
+        service.spaces().endActiveConference(name=nome_espaco, body={}).execute()
     except Exception:
-        pass  # não é crítico -- se já sumiu ou deu erro, só ignora
+        pass  # não é crítico -- se já tava vazia ou deu erro, só ignora
 
 
 async def criar_reuniao(titulo: str, minutos_duracao: int = 60) -> tuple[str, str]:
@@ -112,3 +117,32 @@ async def criar_reuniao(titulo: str, minutos_duracao: int = 60) -> tuple[str, st
 
 async def excluir_reuniao(evento_id: str):
     await asyncio.to_thread(_excluir_reuniao_sync, evento_id)
+
+
+def _contar_participantes_sync(nome_espaco: str) -> int:
+    """Quantas pessoas estão dentro da call agora. Devolve 0 se ninguém
+    entrou ainda ou se a última conferência da sala já acabou -- nunca
+    estoura erro pro painel (só devolve 0 se a consulta falhar)."""
+    service = _get_service_sync()
+    try:
+        registros = service.conferenceRecords().list(
+            filter=f'space.name="{nome_espaco}"', pageSize=1,
+        ).execute()
+        lista = registros.get("conferenceRecords", [])
+        if not lista:
+            return 0
+
+        registro = lista[0]
+        if registro.get("endTime"):  # a conferência mais recente já acabou
+            return 0
+
+        participantes = service.conferenceRecords().participants().list(
+            parent=registro["name"], filter="latest_end_time IS NULL", pageSize=250,
+        ).execute()
+        return len(participantes.get("participants", []))
+    except Exception:
+        return 0
+
+
+async def contar_participantes(nome_espaco: str) -> int:
+    return await asyncio.to_thread(_contar_participantes_sync, nome_espaco)

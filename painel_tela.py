@@ -1,16 +1,27 @@
 """
 Cog: Verificação de Tela / Call (!t / !tela / !tela @user) + Configuração (!config)
 -------------------------------------------------------------------------------------
-Usa Google Meet (via Calendar API do google_meet.py) -- cada !tela cria uma
-reunião de verdade na conta Google configurada nas variáveis de ambiente
-GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN. Com conta
-Google comum (sem Workspace), a call encerra sozinha em DURACAO_CALL_MINUTOS
-quando tem 3+ pessoas (limite do Google, não do bot).
+Usa Google Meet (via Meet API do google_meet.py -- recurso "spaces", accessType
+OPEN) -- cada !tela cria uma sala de verdade na conta Google configurada nas
+variáveis de ambiente GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET /
+GOOGLE_REFRESH_TOKEN. Com conta Google comum (sem Workspace), a call encerra
+sozinha em DURACAO_CALL_MINUTOS quando tem 3+ pessoas (limite do Google, não
+do bot).
+
+Acesso ao link da call:
+    - A sala nasce PRIVADA: só o alvo, o dono da sessão e mediadores
+      conseguem pegar o link pelo botão "Pegar link da call".
+    - Um mediador pode clicar em "Deixar Público" pra abrir o acesso: depois
+      disso, qualquer pessoa que clicar em "Pegar link da call" recebe o link.
+    - Isso é uma restrição só no nível do painel do Discord -- o Meet em si
+      já é criado com accessType OPEN (ninguém bate numa "sala de espera" do
+      Google depois de conseguir o link).
 
 Sistema de espectador: a sessão gera um código curto (ex: FQQ96K). Quem tiver
 o código pode entrar no canal configurado (#ver-tela), clicar no painel fixo
 "Assistir Análise", digitar o código num formulário e recebe o link da call
-(ephemeral, só ele vê).
+(ephemeral, só ele vê) -- isso funciona independente da sala estar pública
+ou não.
 
 !config -> painel com:
     - cargos autorizados a usar !t / !tela (RoleSelect)
@@ -20,9 +31,11 @@ o código pode entrar no canal configurado (#ver-tela), clicar no painel fixo
   no canal escolhido.
 
 !t / !tela [@alguem] -> cria a call e o painel do mediador (V2, com thumbnail
-  do ícone do servidor, cor da org, separadores, emojis). O link do Meet é
-  único (o Meet não separa por papel como o Jitsi fazia), então o botão só
-  muda o texto conforme quem clica é o alvo ou o mediador.
+  do ícone do servidor, cor da org, separadores). O link do Meet é único (o
+  Meet não separa por papel), então o botão só muda o texto conforme quem
+  clica é o alvo ou o mediador. O painel também mostra, ao vivo, quantas
+  pessoas estão dentro da call agora (consulta a Meet API a cada ~25s
+  enquanto a sessão está ativa).
 """
 
 import os
@@ -99,7 +112,8 @@ def _criar_tabelas_sync():
             criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'ativa',
             link_meet TEXT,
-            evento_id TEXT
+            evento_id TEXT,
+            publica INTEGER NOT NULL DEFAULT 0
         )
     """)
     # migração: bancos antigos (era feito só pro Jitsi, sem essas colunas)
@@ -107,6 +121,8 @@ def _criar_tabelas_sync():
     for coluna in ("link_meet", "evento_id"):
         if colunas_sessoes and coluna not in colunas_sessoes:
             conn.execute(f"ALTER TABLE tela_sessoes ADD COLUMN {coluna} TEXT")
+    if colunas_sessoes and "publica" not in colunas_sessoes:
+        conn.execute("ALTER TABLE tela_sessoes ADD COLUMN publica INTEGER NOT NULL DEFAULT 0")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS guild_config (
@@ -162,6 +178,13 @@ def _buscar_evento_id_sync(sala: str) -> str | None:
 def _encerrar_sessao_sync(sala: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("UPDATE tela_sessoes SET status = 'encerrada' WHERE sala = ?", (sala,))
+    conn.commit()
+    conn.close()
+
+
+def _definir_publica_sync(sala: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE tela_sessoes SET publica = 1 WHERE sala = ?", (sala,))
     conn.commit()
     conn.close()
 
@@ -395,10 +418,15 @@ class BotaoGerarUrl(Button):
         eh_alvo = painel.alvo_id and interaction.user.id == painel.alvo_id
         eh_mediador = interaction.user.id == painel.adm_id or await painel.cog._checar_mediador_membro(interaction.user)
 
+        if not painel.publica and not (eh_alvo or eh_mediador):
+            return await interaction.response.send_message(
+                "Essa análise ainda é privada. Peça pra um mediador deixar público, "
+                "ou use um código de espectador no painel de #ver-tela.", ephemeral=True
+            )
+
         # o Meet só tem um link por reunião -- não dá pra separar por papel
         # como no Jitsi, então o texto muda conforme o papel, mas o link é o
-        # mesmo pra todo mundo que clicar (o link já não é exclusivo depois
-        # de gerado, então não faz sentido bloquear o clique em si)
+        # mesmo pra todo mundo que clicar
         if eh_alvo:
             texto = "Entre e **compartilhe sua tela** assim que possível:"
         elif eh_mediador:
@@ -409,6 +437,26 @@ class BotaoGerarUrl(Button):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=painel.link_meet))
         await interaction.response.send_message(texto, view=view, ephemeral=True)
+
+
+class BotaoDeixarPublico(Button):
+    def __init__(self, painel: "PainelTela"):
+        super().__init__(label="Deixar Público", style=discord.ButtonStyle.secondary, row=1)
+        self.painel = painel
+
+    async def callback(self, interaction: discord.Interaction):
+        painel = self.painel
+        eh_dono = interaction.user.id == painel.adm_id
+        eh_mediador = await painel.cog._checar_mediador_membro(interaction.user)
+        if not (eh_dono or eh_mediador):
+            return await interaction.response.send_message(
+                "Só quem criou a análise ou um mediador pode deixar a call pública.", ephemeral=True
+            )
+
+        painel.publica = True
+        await asyncio.to_thread(_definir_publica_sync, painel.sala)
+        painel._montar_conteudo()
+        await interaction.response.edit_message(view=painel)
 
 
 class BotaoEncerrarSessao(Button):
@@ -426,6 +474,7 @@ class BotaoEncerrarSessao(Button):
             )
 
         await interaction.response.defer()
+        painel.parar_atualizacao()
         await asyncio.to_thread(_encerrar_sessao_sync, painel.sala)
         evento_id = await asyncio.to_thread(_buscar_evento_id_sync, painel.sala)
         if evento_id:
@@ -434,10 +483,18 @@ class BotaoEncerrarSessao(Button):
         await interaction.message.edit(view=painel)
 
 
+# tempo entre consultas do contador de participantes -- não precisa ser muito
+# curto, é só pra dar a sensação de "ao vivo" sem estourar a cota da API
+INTERVALO_CONTADOR_SEGUNDOS = 25
+# corta o loop sozinho depois desse tempo, mesmo que ninguém clique em
+# "Encerrar" -- rede de segurança pra não deixar tasks penduradas pra sempre
+LIMITE_LOOP_MINUTOS = DURACAO_CALL_MINUTOS + 15
+
+
 class PainelTela(LayoutView):
     def __init__(self, cog: "Tela", guild: discord.Guild, sala: str, codigo: str,
                  adm_id: int, alvo: discord.Member = None, cor: int = COR_PADRAO,
-                 link_meet: str = None):
+                 link_meet: str = None, nome_espaco: str = None, publica: bool = False):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
@@ -448,9 +505,44 @@ class PainelTela(LayoutView):
         self.alvo_id = alvo.id if alvo else None
         self.cor = cor
         self.link_meet = link_meet
+        self.nome_espaco = nome_espaco
+        self.publica = publica
+
+        self.participantes = 0
+        self.encerrada = False
+        self.message: discord.Message | None = None
 
         self.container = Container(accent_color=discord.Color(cor))
         self._montar_conteudo()  # já adiciona self.container à view (necessário pro re-render no encerrar)
+
+        self._task_participantes = asyncio.create_task(self._loop_participantes())
+
+    def parar_atualizacao(self):
+        self.encerrada = True
+        if self._task_participantes and not self._task_participantes.done():
+            self._task_participantes.cancel()
+
+    async def _loop_participantes(self):
+        """Atualiza o contador de "participantes na call agora" periodicamente
+        enquanto a sessão estiver ativa. Só edita a mensagem quando o número
+        muda, pra não ficar re-editando à toa."""
+        if not self.nome_espaco:
+            return
+        decorridos = 0
+        while decorridos < LIMITE_LOOP_MINUTOS * 60:
+            await asyncio.sleep(INTERVALO_CONTADOR_SEGUNDOS)
+            decorridos += INTERVALO_CONTADOR_SEGUNDOS
+            if self.encerrada:
+                return
+            novo_total = await google_meet.contar_participantes(self.nome_espaco)
+            if novo_total != self.participantes:
+                self.participantes = novo_total
+                self._montar_conteudo()
+                if self.message:
+                    try:
+                        await self.message.edit(view=self)
+                    except discord.HTTPException:
+                        pass
 
     def _montar_conteudo(self, encerrada=False):
         self.container.clear_items()
@@ -471,18 +563,27 @@ class PainelTela(LayoutView):
 
         alvo_linha = (f"**Jogador em análise:** {self.alvo.mention}" if self.alvo
                        else "**Tipo de sessão:** Sala aberta")
+        acesso_linha = ("**Acesso:** Pública — qualquer pessoa entra pelo botão abaixo" if self.publica
+                         else "**Acesso:** Privada — só o alvo e mediadores entram direto")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
             f"**Status:** Ativa · encerra automaticamente em {DURACAO_CALL_MINUTOS} min\n"
+            f"{acesso_linha}\n"
+            f"**Participantes na call agora:** {self.participantes}\n"
             f"**Código de acesso:** `{self.codigo}`\n\n"
             f"-# Compartilhe esse código no painel de #ver-tela para liberar o acesso aos espectadores."
         ))
         self.container.add_item(Separator())
 
-        row = ActionRow()
-        row.add_item(BotaoGerarUrl(self))
-        row.add_item(BotaoEncerrarSessao(self))
-        self.container.add_item(row)
+        row0 = ActionRow()
+        row0.add_item(BotaoGerarUrl(self))
+        row0.add_item(BotaoEncerrarSessao(self))
+        self.container.add_item(row0)
+
+        if not self.publica:
+            row1 = ActionRow()
+            row1.add_item(BotaoDeixarPublico(self))
+            self.container.add_item(row1)
 
         self.add_item(self.container)
 
@@ -606,8 +707,9 @@ class Tela(commands.Cog):
                 )
 
                 cor = await _cor_da_guild(ctx.guild.id)
-                painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor, link_meet)
-                await ctx.send(view=painel)
+                painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor,
+                                     link_meet, nome_espaco=evento_id)
+                painel.message = await ctx.send(view=painel)
             except RuntimeError as e:
                 # normalmente é falta de variável de ambiente do Google
                 return await ctx.send(f"❌ {e}", delete_after=30)
