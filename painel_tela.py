@@ -336,8 +336,8 @@ class ModalCodigoEspectador(Modal, title="Assistir Análise"):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=link))
         await interaction.response.send_message(
-            f"✅ Seu link está pronto.\n-# {EMOJIS['aviso']} Entre com o **microfone e câmera desligados** "
-            "pra não atrapalhar a análise.",
+            "**Seu acesso foi liberado.**\n"
+            "-# Entre com o microfone e a câmera desligados para não atrapalhar a análise.",
             view=view, ephemeral=True,
         )
 
@@ -345,16 +345,23 @@ class ModalCodigoEspectador(Modal, title="Assistir Análise"):
 class PainelEspectador(LayoutView):
     """Painel fixo, sem estado próprio -> pode ser reregistrado com bot.add_view()."""
 
-    def __init__(self, cog: "Tela", cor: int = COR_PADRAO):
+    def __init__(self, cog: "Tela", guild: discord.Guild = None, cor: int = COR_PADRAO):
         super().__init__(timeout=None)
         self.cog = cog
         container = Container(accent_color=discord.Color(cor))
-        container.add_item(TextDisplay(f"## {EMOJIS['espectador']} Assistir Análise"))
+
+        titulo = TextDisplay("## Assistir Análise")
+        icone_url = guild.icon.url if guild and guild.icon else None
+        if icone_url:
+            container.add_item(Section(titulo, accessory=Thumbnail(icone_url)))
+        else:
+            container.add_item(titulo)
         container.add_item(Separator())
+
         container.add_item(TextDisplay(
-            f"{EMOJIS['codigo']} Recebeu um **código de análise**? Clique no botão abaixo e "
-            "digite o código pra pegar o link da call.\n"
-            f"-# {EMOJIS['aviso']} Entre sempre com o microfone e a câmera desligados."
+            "Recebeu um **código de análise**? Toque no botão abaixo e informe o código "
+            "para liberar o acesso à sessão.\n"
+            "-# Entre sempre com o microfone e a câmera desligados."
         ))
         container.add_item(Separator())
         row = ActionRow()
@@ -366,7 +373,7 @@ class PainelEspectador(LayoutView):
 class BotaoEntrarEspectador(Button):
     def __init__(self, cog: "Tela"):
         super().__init__(
-            label="Entrar na Análise", emoji=EMOJIS['espectador'], style=discord.ButtonStyle.secondary,
+            label="Entrar na Análise", style=discord.ButtonStyle.secondary,
             custom_id="ffz_call:entrar_espectador",
         )
         self.cog = cog
@@ -388,18 +395,16 @@ class BotaoGerarUrl(Button):
         eh_alvo = painel.alvo_id and interaction.user.id == painel.alvo_id
         eh_mediador = interaction.user.id == painel.adm_id or await painel.cog._checar_mediador_membro(interaction.user)
 
-        if not (eh_alvo or eh_mediador):
-            return await interaction.response.send_message(
-                "❌ Essa sala não é sua. Se você tem um código de espectador, use o painel "
-                "de #ver-tela em vez desse botão.", ephemeral=True
-            )
-
         # o Meet só tem um link por reunião -- não dá pra separar por papel
-        # como no Jitsi, então o texto muda mas o link é o mesmo pra todo mundo
+        # como no Jitsi, então o texto muda conforme o papel, mas o link é o
+        # mesmo pra todo mundo que clicar (o link já não é exclusivo depois
+        # de gerado, então não faz sentido bloquear o clique em si)
         if eh_alvo:
-            texto = f"{EMOJIS['link']} Entre e **compartilhe sua tela** assim que puder:"
+            texto = "Entre e **compartilhe sua tela** assim que possível:"
+        elif eh_mediador:
+            texto = f"{EMOJIS['escudo']} Entre para acompanhar a análise como mediador:"
         else:
-            texto = f"{EMOJIS['escudo']} Entre pra acompanhar a análise como mediador:"
+            texto = "Entre para acompanhar a análise:"
 
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=painel.link_meet))
@@ -460,17 +465,17 @@ class PainelTela(LayoutView):
         self.container.add_item(Separator())
 
         if encerrada:
-            self.container.add_item(TextDisplay(f"**Status:** {EMOJIS['status_encerrada']} sala encerrada"))
+            self.container.add_item(TextDisplay("**Status:** Sessão encerrada."))
             self.add_item(self.container)
             return
 
-        alvo_linha = (f"{EMOJIS['alvo']} **Alvo:** {self.alvo.mention}" if self.alvo
-                       else f"{EMOJIS['alvo']} **Tipo:** sala aberta")
+        alvo_linha = (f"**Jogador em análise:** {self.alvo.mention}" if self.alvo
+                       else "**Tipo de sessão:** Sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"{EMOJIS['status_ativa']} **Status:** ativa · encerra sozinha em {DURACAO_CALL_MINUTOS}min\n"
-            f"{EMOJIS['codigo']} **Código de espectador:** `{self.codigo}`\n\n"
-            f"-# Divulgue o código pra galera assistir pelo painel de #ver-tela."
+            f"**Status:** Ativa · encerra automaticamente em {DURACAO_CALL_MINUTOS} min\n"
+            f"**Código de acesso:** `{self.codigo}`\n\n"
+            f"-# Compartilhe esse código no painel de #ver-tela para liberar o acesso aos espectadores."
         ))
         self.container.add_item(Separator())
 
@@ -526,7 +531,7 @@ class Tela(commands.Cog):
     async def publicar_painel_espectador(self, canal: discord.TextChannel):
         cfg = await asyncio.to_thread(_buscar_config_sync, canal.guild.id)
         cor = cfg["cor"] if cfg["cor"] is not None else COR_PADRAO
-        painel = PainelEspectador(self, cor=cor)
+        painel = PainelEspectador(self, canal.guild, cor=cor)
 
         msg = None
         if cfg["painel_msg_id"]:
