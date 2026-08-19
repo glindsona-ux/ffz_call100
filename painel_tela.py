@@ -47,16 +47,31 @@ MAX_CARGOS = 10
 COR_PADRAO = 0x2B2D31  # cinza escuro discord, usado se a org não configurar cor
 CARACTERES_CODIGO = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
 
-# ---------- emojis (troque pelos custom do seu servidor: formato <:nome:id> ou <a:nome:id>) ----------
-EMOJI_CALL = "🎥"
-EMOJI_ALVO = "🎯"
-EMOJI_STATUS_ATIVA = "🟢"
-EMOJI_STATUS_ENCERRADA = "🔴"
-EMOJI_CODIGO = "🔑"
-EMOJI_ESPECTADOR = "👁️"
-EMOJI_ESCUDO = "🛡️"
-EMOJI_LINK = "🔗"
-EMOJI_AVISO = "⚠️"
+# ---------- emojis: puxados do Developer Portal (aba "Emojis" do seu app) ----------
+# Sobe um emoji lá com cada um desses nomes; o bot busca sozinho no cog_load.
+# Se algum ainda não tiver sido subido, usa o padrão (unicode) como fallback.
+EMOJIS = {
+    "call": "🎥",
+    "alvo": "🎯",
+    "status_ativa": "🟢",
+    "status_encerrada": "🔴",
+    "codigo": "🔑",
+    "espectador": "👁️",
+    "escudo": "🛡️",
+    "link": "🔗",
+    "aviso": "⚠️",
+}
+NOME_NO_PORTAL_PARA_CHAVE = {
+    "ffz_call": "call",
+    "ffz_alvo": "alvo",
+    "ffz_status_ativa": "status_ativa",
+    "ffz_status_encerrada": "status_encerrada",
+    "ffz_codigo": "codigo",
+    "ffz_espectador": "espectador",
+    "ffz_escudo": "escudo",
+    "ffz_link": "link",
+    "ffz_aviso": "aviso",
+}
 DURACAO_CALL_MINUTOS = 60  # limite do Meet grátis pra 3+ pessoas na call
 
 
@@ -321,7 +336,7 @@ class ModalCodigoEspectador(Modal, title="Assistir Análise"):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=link))
         await interaction.response.send_message(
-            f"✅ Seu link está pronto.\n-# {EMOJI_AVISO} Entre com o **microfone e câmera desligados** "
+            f"✅ Seu link está pronto.\n-# {EMOJIS['aviso']} Entre com o **microfone e câmera desligados** "
             "pra não atrapalhar a análise.",
             view=view, ephemeral=True,
         )
@@ -334,12 +349,12 @@ class PainelEspectador(LayoutView):
         super().__init__(timeout=None)
         self.cog = cog
         container = Container(accent_color=discord.Color(cor))
-        container.add_item(TextDisplay(f"## {EMOJI_ESPECTADOR} Assistir Análise"))
+        container.add_item(TextDisplay(f"## {EMOJIS['espectador']} Assistir Análise"))
         container.add_item(Separator())
         container.add_item(TextDisplay(
-            f"{EMOJI_CODIGO} Recebeu um **código de análise**? Clique no botão abaixo e "
+            f"{EMOJIS['codigo']} Recebeu um **código de análise**? Clique no botão abaixo e "
             "digite o código pra pegar o link da call.\n"
-            f"-# {EMOJI_AVISO} Entre sempre com o microfone e a câmera desligados."
+            f"-# {EMOJIS['aviso']} Entre sempre com o microfone e a câmera desligados."
         ))
         container.add_item(Separator())
         row = ActionRow()
@@ -351,7 +366,7 @@ class PainelEspectador(LayoutView):
 class BotaoEntrarEspectador(Button):
     def __init__(self, cog: "Tela"):
         super().__init__(
-            label="Entrar na Análise", emoji=EMOJI_ESPECTADOR, style=discord.ButtonStyle.secondary,
+            label="Entrar na Análise", emoji=EMOJIS['espectador'], style=discord.ButtonStyle.secondary,
             custom_id="ffz_call:entrar_espectador",
         )
         self.cog = cog
@@ -364,7 +379,7 @@ class BotaoEntrarEspectador(Button):
 
 class BotaoGerarUrl(Button):
     def __init__(self, painel: "PainelTela"):
-        super().__init__(label="Pegar link da call", emoji=EMOJI_LINK,
+        super().__init__(label="Pegar link da call", emoji=EMOJIS['link'],
                           style=discord.ButtonStyle.primary, row=0)
         self.painel = painel
 
@@ -382,9 +397,9 @@ class BotaoGerarUrl(Button):
         # o Meet só tem um link por reunião -- não dá pra separar por papel
         # como no Jitsi, então o texto muda mas o link é o mesmo pra todo mundo
         if eh_alvo:
-            texto = f"{EMOJI_LINK} Entre e **compartilhe sua tela** assim que puder:"
+            texto = f"{EMOJIS['link']} Entre e **compartilhe sua tela** assim que puder:"
         else:
-            texto = f"{EMOJI_ESCUDO} Entre pra acompanhar a análise como mediador:"
+            texto = f"{EMOJIS['escudo']} Entre pra acompanhar a análise como mediador:"
 
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=painel.link_meet))
@@ -437,7 +452,7 @@ class PainelTela(LayoutView):
         self.clear_items()
 
         icone_url = self.guild.icon.url if self.guild.icon else None
-        titulo = TextDisplay(f"## {EMOJI_CALL} Verificação de Tela")
+        titulo = TextDisplay(f"## {EMOJIS['call']} Verificação de Tela")
         if icone_url:
             self.container.add_item(Section(titulo, accessory=Thumbnail(icone_url)))
         else:
@@ -445,16 +460,16 @@ class PainelTela(LayoutView):
         self.container.add_item(Separator())
 
         if encerrada:
-            self.container.add_item(TextDisplay(f"**Status:** {EMOJI_STATUS_ENCERRADA} sala encerrada"))
+            self.container.add_item(TextDisplay(f"**Status:** {EMOJIS['status_encerrada']} sala encerrada"))
             self.add_item(self.container)
             return
 
-        alvo_linha = (f"{EMOJI_ALVO} **Alvo:** {self.alvo.mention}" if self.alvo
-                       else f"{EMOJI_ALVO} **Tipo:** sala aberta")
+        alvo_linha = (f"{EMOJIS['alvo']} **Alvo:** {self.alvo.mention}" if self.alvo
+                       else f"{EMOJIS['alvo']} **Tipo:** sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"{EMOJI_STATUS_ATIVA} **Status:** ativa · encerra sozinha em {DURACAO_CALL_MINUTOS}min\n"
-            f"{EMOJI_CODIGO} **Código de espectador:** `{self.codigo}`\n\n"
+            f"{EMOJIS['status_ativa']} **Status:** ativa · encerra sozinha em {DURACAO_CALL_MINUTOS}min\n"
+            f"{EMOJIS['codigo']} **Código de espectador:** `{self.codigo}`\n\n"
             f"-# Divulgue o código pra galera assistir pelo painel de #ver-tela."
         ))
         self.container.add_item(Separator())
@@ -475,9 +490,29 @@ class Tela(commands.Cog):
 
     async def cog_load(self):
         await asyncio.to_thread(_criar_tabelas_sync)
+        await self._carregar_emojis_do_portal()
         # painel de espectador não tem estado -> pode ser registrado direto,
         # sobrevive a restart porque o custom_id bate
         self.bot.add_view(PainelEspectador(self))
+
+    async def _carregar_emojis_do_portal(self):
+        """Busca os emojis do aplicativo (Developer Portal > Emojis) e preenche
+        o dicionário EMOJIS pelas chaves em NOME_NO_PORTAL_PARA_CHAVE. Qualquer
+        emoji que ainda não tiver sido subido lá simplesmente mantém o fallback
+        unicode -- não trava o bot."""
+        try:
+            emojis_do_app = await self.bot.fetch_application_emojis()
+        except discord.HTTPException as e:
+            print(f"⚠️ Não consegui buscar emojis do Developer Portal: {e}")
+            return
+
+        encontrados = 0
+        for emoji in emojis_do_app:
+            chave = NOME_NO_PORTAL_PARA_CHAVE.get(emoji.name)
+            if chave:
+                EMOJIS[chave] = str(emoji)
+                encontrados += 1
+        print(f"✅ {encontrados}/{len(NOME_NO_PORTAL_PARA_CHAVE)} emojis carregados do Developer Portal.")
 
     async def publicar_painel_espectador(self, canal: discord.TextChannel):
         cfg = await asyncio.to_thread(_buscar_config_sync, canal.guild.id)
