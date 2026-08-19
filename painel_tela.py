@@ -441,7 +441,7 @@ class BotaoGerarUrl(Button):
 
 class BotaoDeixarPublico(Button):
     def __init__(self, painel: "PainelTela"):
-        super().__init__(label="Deixar Público", style=discord.ButtonStyle.secondary, row=1)
+        super().__init__(label="Deixar Público", emoji="🔓", style=discord.ButtonStyle.secondary, row=0)
         self.painel = painel
 
     async def callback(self, interaction: discord.Interaction):
@@ -561,29 +561,44 @@ class PainelTela(LayoutView):
             self.add_item(self.container)
             return
 
-        alvo_linha = (f"**Jogador em análise:** {self.alvo.mention}" if self.alvo
-                       else "**Tipo de sessão:** Sala aberta")
-        acesso_linha = ("**Acesso:** Pública — qualquer pessoa entra pelo botão abaixo" if self.publica
-                         else "**Acesso:** Privada — só o alvo e mediadores entram direto")
+        # ---- bloco 1: quem/o quê ----
+        alvo_linha = (f"**{EMOJIS['alvo']} Jogador em análise:** {self.alvo.mention}" if self.alvo
+                       else f"**{EMOJIS['alvo']} Tipo de sessão:** Sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"**Status:** Ativa · encerra automaticamente em {DURACAO_CALL_MINUTOS} min\n"
-            f"{acesso_linha}\n"
-            f"**Participantes na call agora:** {self.participantes}\n"
-            f"**Código de acesso:** `{self.codigo}`\n\n"
-            f"-# Compartilhe esse código no painel de #ver-tela para liberar o acesso aos espectadores."
+            f"-# A call já está ativa no Google Meet. Use os botões abaixo para gerenciar o acesso."
         ))
         self.container.add_item(Separator())
 
-        row0 = ActionRow()
-        row0.add_item(BotaoGerarUrl(self))
-        row0.add_item(BotaoEncerrarSessao(self))
-        self.container.add_item(row0)
+        # ---- bloco 2: status ao vivo ----
+        status_emoji = EMOJIS['status_ativa']
+        acesso_txt = "Pública — qualquer pessoa entra pelo botão abaixo" if self.publica \
+            else "Privada — só o alvo e mediadores entram direto"
+        self.container.add_item(TextDisplay(
+            f"{status_emoji} **Status:** Ativa · encerra sozinha em {DURACAO_CALL_MINUTOS} min\n"
+            f"{EMOJIS['escudo']} **Acesso:** {acesso_txt}\n"
+            f"{EMOJIS['call']} **Participantes na call agora:** `{self.participantes}`"
+        ))
+        self.container.add_item(Separator())
 
+        # ---- bloco 3: código de espectador ----
+        self.container.add_item(TextDisplay(
+            f"{EMOJIS['codigo']} **Código de acesso:** `{self.codigo}`\n"
+            f"-# {EMOJIS['espectador']} Compartilhe esse código no painel de #ver-tela para liberar "
+            f"o acesso aos espectadores."
+        ))
+        self.container.add_item(Separator())
+
+        # ---- ações: deixar público em destaque (topo), link + encerrar lado a lado ----
         if not self.publica:
-            row1 = ActionRow()
-            row1.add_item(BotaoDeixarPublico(self))
-            self.container.add_item(row1)
+            row_publico = ActionRow()
+            row_publico.add_item(BotaoDeixarPublico(self))
+            self.container.add_item(row_publico)
+
+        row_acoes = ActionRow()
+        row_acoes.add_item(BotaoGerarUrl(self))
+        row_acoes.add_item(BotaoEncerrarSessao(self))
+        self.container.add_item(row_acoes)
 
         self.add_item(self.container)
 
