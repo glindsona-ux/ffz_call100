@@ -487,13 +487,22 @@ class PainelTela(LayoutView):
 class Tela(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._emojis_carregados = False
 
     async def cog_load(self):
         await asyncio.to_thread(_criar_tabelas_sync)
-        await self._carregar_emojis_do_portal()
         # painel de espectador não tem estado -> pode ser registrado direto,
         # sobrevive a restart porque o custom_id bate
         self.bot.add_view(PainelEspectador(self))
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # só dá pra buscar emojis do app depois do login (precisa do
+        # application_id, que só existe depois que o bot conecta) --
+        # por isso isso não pode ficar no cog_load, que roda antes do login
+        if not self._emojis_carregados:
+            await self._carregar_emojis_do_portal()
+            self._emojis_carregados = True
 
     async def _carregar_emojis_do_portal(self):
         """Busca os emojis do aplicativo (Developer Portal > Emojis) e preenche
