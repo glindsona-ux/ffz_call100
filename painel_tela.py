@@ -1,13 +1,16 @@
 """
 Cog: Verificação de Tela / Call (!t / !tela / !tela @user) + Configuração (!config)
 -------------------------------------------------------------------------------------
-Usa o Jitsi Meet público (meet.jit.si) — sem API, sem token, sem limite de tempo.
-Cada sala é um slug aleatório; não precisa renovar nada.
+Usa Google Meet (via Calendar API do google_meet.py) -- cada !tela cria uma
+reunião de verdade na conta Google configurada nas variáveis de ambiente
+GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN. Com conta
+Google comum (sem Workspace), a call encerra sozinha em DURACAO_CALL_MINUTOS
+quando tem 3+ pessoas (limite do Google, não do bot).
 
 Sistema de espectador: a sessão gera um código curto (ex: FQQ96K). Quem tiver
 o código pode entrar no canal configurado (#ver-tela), clicar no painel fixo
-"Assistir Análise", digitar o código num formulário e recebe um link pessoal
-pra assistir (ephemeral, só ele vê).
+"Assistir Análise", digitar o código num formulário e recebe o link da call
+(ephemeral, só ele vê).
 
 !config -> painel com:
     - cargos autorizados a usar !t / !tela (RoleSelect)
@@ -16,10 +19,10 @@ pra assistir (ephemeral, só ele vê).
   Ao salvar, o painel de espectador é publicado/atualizado automaticamente
   no canal escolhido.
 
-!t / !tela [@alguem] -> cria a sala e o painel do mediador (V2, com thumbnail
-  do ícone do servidor, cor da org, separadores). Botão "Gerar URL Pessoal"
-  entrega um link diferente pra quem é o alvo (compartilha tela) e pra quem é
-  mediador/adm (assiste como espectador "oficial").
+!t / !tela [@alguem] -> cria a call e o painel do mediador (V2, com thumbnail
+  do ícone do servidor, cor da org, separadores, emojis). O link do Meet é
+  único (o Meet não separa por papel como o Jitsi fazia), então o botão só
+  muda o texto conforme quem clica é o alvo ou o mediador.
 """
 
 import os
@@ -28,7 +31,6 @@ import string
 import random
 import sqlite3
 import asyncio
-from urllib.parse import quote
 
 import discord
 from discord.ext import commands
@@ -37,11 +39,25 @@ from discord.ui import (
     Section, Thumbnail, Modal, TextInput,
 )
 
+import google_meet
+
 DB_PATH = "ffz_data.db"
 
 MAX_CARGOS = 10
 COR_PADRAO = 0x2B2D31  # cinza escuro discord, usado se a org não configurar cor
 CARACTERES_CODIGO = string.ascii_uppercase.replace("O", "").replace("I", "") + "23456789"
+
+# ---------- emojis (troque pelos custom do seu servidor: formato <:nome:id> ou <a:nome:id>) ----------
+EMOJI_CALL = "🎥"
+EMOJI_ALVO = "🎯"
+EMOJI_STATUS_ATIVA = "🟢"
+EMOJI_STATUS_ENCERRADA = "🔴"
+EMOJI_CODIGO = "🔑"
+EMOJI_ESPECTADOR = "👁️"
+EMOJI_ESCUDO = "🛡️"
+EMOJI_LINK = "🔗"
+EMOJI_AVISO = "⚠️"
+DURACAO_CALL_MINUTOS = 60  # limite do Meet grátis pra 3+ pessoas na call
 
 
 # ---------- camada de dados (sqlite síncrono, rodado em thread) ----------
@@ -66,9 +82,16 @@ def _criar_tabelas_sync():
             adm_id INTEGER NOT NULL,
             alvo_id INTEGER,
             criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'ativa'
+            status TEXT DEFAULT 'ativa',
+            link_meet TEXT,
+            evento_id TEXT
         )
     """)
+    # migração: bancos antigos (era feito só pro Jitsi, sem essas colunas)
+    colunas_sessoes = _colunas_de(conn, "tela_sessoes")
+    for coluna in ("link_meet", "evento_id"):
+        if colunas_sessoes and coluna not in colunas_sessoes:
+            conn.execute(f"ALTER TABLE tela_sessoes ADD COLUMN {coluna} TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS guild_config (
@@ -102,14 +125,23 @@ def _gerar_codigo_unico_sync() -> str:
             return codigo
 
 
-def _salvar_sessao_sync(sala: str, codigo: str, guild_id: int, adm_id: int, alvo_id: int = None):
+def _salvar_sessao_sync(sala: str, codigo: str, guild_id: int, adm_id: int, alvo_id: int = None,
+                         link_meet: str = None, evento_id: str = None):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO tela_sessoes (sala, codigo, guild_id, adm_id, alvo_id) VALUES (?, ?, ?, ?, ?)",
-        (sala, codigo, guild_id, adm_id, alvo_id),
+        "INSERT INTO tela_sessoes (sala, codigo, guild_id, adm_id, alvo_id, link_meet, evento_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sala, codigo, guild_id, adm_id, alvo_id, link_meet, evento_id),
     )
     conn.commit()
     conn.close()
+
+
+def _buscar_evento_id_sync(sala: str) -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT evento_id FROM tela_sessoes WHERE sala = ?", (sala,)).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def _encerrar_sessao_sync(sala: str):
@@ -122,12 +154,12 @@ def _encerrar_sessao_sync(sala: str):
 def _buscar_sessao_por_codigo_sync(guild_id: int, codigo: str):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT sala, adm_id, alvo_id FROM tela_sessoes "
+        "SELECT sala, adm_id, alvo_id, link_meet FROM tela_sessoes "
         "WHERE guild_id = ? AND codigo = ? AND status = 'ativa'",
         (guild_id, codigo.strip().upper()),
     ).fetchone()
     conn.close()
-    return row  # (sala, adm_id, alvo_id) ou None
+    return row  # (sala, adm_id, alvo_id, link_meet) ou None
 
 
 def _buscar_config_sync(guild_id: int) -> dict:
@@ -158,20 +190,6 @@ def _salvar_config_sync(guild_id: int, **campos):
         conn.execute(f"UPDATE guild_config SET {chave} = ? WHERE guild_id = ?", (valor, guild_id))
     conn.commit()
     conn.close()
-
-
-# ---------- Jitsi: só monta a URL, não tem API nem token ----------
-
-def _gerar_link_jitsi(sala: str, nome_exibicao: str, espectador: bool = False) -> str:
-    nome = quote(nome_exibicao)
-    partes = [f'userInfo.displayName="{nome}"']
-    if espectador:
-        # sem controle real de "somente visualização" no Jitsi público,
-        # então pelo menos entra mudo pra não atrapalhar
-        partes.append("config.startWithAudioMuted=true")
-        partes.append("config.startWithVideoMuted=true")
-    frag = "&".join(partes)
-    return f"https://meet.jit.si/{sala}#{frag}"
 
 
 # ---------- utilitário de cor/permissão compartilhados pelo cog ----------
@@ -298,14 +316,13 @@ class ModalCodigoEspectador(Modal, title="Assistir Análise"):
                 "❌ Código inválido ou a análise já foi encerrada.", ephemeral=True
             )
 
-        sala, adm_id, alvo_id = sessao
-        link = _gerar_link_jitsi(sala, f"👁 {interaction.user.display_name}", espectador=True)
+        sala, adm_id, alvo_id, link = sessao
 
         view = discord.ui.View()
-        view.add_item(discord.ui.Button(label="Entrar e assistir", style=discord.ButtonStyle.link, url=link))
+        view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=link))
         await interaction.response.send_message(
-            "✅ Seu link está pronto. É pessoal e de uso único — não repasse, "
-            "cada espectador deve pegar o próprio código.",
+            f"✅ Seu link está pronto.\n-# {EMOJI_AVISO} Entre com o **microfone e câmera desligados** "
+            "pra não atrapalhar a análise.",
             view=view, ephemeral=True,
         )
 
@@ -317,12 +334,12 @@ class PainelEspectador(LayoutView):
         super().__init__(timeout=None)
         self.cog = cog
         container = Container(accent_color=discord.Color(cor))
-        container.add_item(TextDisplay("## 📺 Assistir Análise"))
+        container.add_item(TextDisplay(f"## {EMOJI_ESPECTADOR} Assistir Análise"))
         container.add_item(Separator())
         container.add_item(TextDisplay(
-            "Recebeu um **código de análise**? Clique no botão abaixo, digite o código "
-            "e você recebe um link exclusivo pra assistir à transmissão ao vivo.\n\n"
-            "-# Cada link é individual e de uso único — não repasse, gere o seu."
+            f"{EMOJI_CODIGO} Recebeu um **código de análise**? Clique no botão abaixo e "
+            "digite o código pra pegar o link da call.\n"
+            f"-# {EMOJI_AVISO} Entre sempre com o microfone e a câmera desligados."
         ))
         container.add_item(Separator())
         row = ActionRow()
@@ -334,7 +351,7 @@ class PainelEspectador(LayoutView):
 class BotaoEntrarEspectador(Button):
     def __init__(self, cog: "Tela"):
         super().__init__(
-            label="Entrar na Análise", style=discord.ButtonStyle.secondary,
+            label="Entrar na Análise", emoji=EMOJI_ESPECTADOR, style=discord.ButtonStyle.secondary,
             custom_id="ffz_call:entrar_espectador",
         )
         self.cog = cog
@@ -347,7 +364,8 @@ class BotaoEntrarEspectador(Button):
 
 class BotaoGerarUrl(Button):
     def __init__(self, painel: "PainelTela"):
-        super().__init__(label="Gerar URL Pessoal", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="Pegar link da call", emoji=EMOJI_LINK,
+                          style=discord.ButtonStyle.primary, row=0)
         self.painel = painel
 
     async def callback(self, interaction: discord.Interaction):
@@ -361,15 +379,15 @@ class BotaoGerarUrl(Button):
                 "de #ver-tela em vez desse botão.", ephemeral=True
             )
 
+        # o Meet só tem um link por reunião -- não dá pra separar por papel
+        # como no Jitsi, então o texto muda mas o link é o mesmo pra todo mundo
         if eh_alvo:
-            link = _gerar_link_jitsi(painel.sala, interaction.user.display_name, espectador=False)
-            texto = "🔗 Seu link pessoal — **entre e compartilhe sua tela**:"
+            texto = f"{EMOJI_LINK} Entre e **compartilhe sua tela** assim que puder:"
         else:
-            link = _gerar_link_jitsi(painel.sala, f"🛡 {interaction.user.display_name}", espectador=False)
-            texto = "🔗 Seu link de moderador — entre pra acompanhar a análise:"
+            texto = f"{EMOJI_ESCUDO} Entre pra acompanhar a análise como mediador:"
 
         view = discord.ui.View()
-        view.add_item(discord.ui.Button(label="Entrar e compartilhar tela", style=discord.ButtonStyle.link, url=link))
+        view.add_item(discord.ui.Button(label="Entrar na call", style=discord.ButtonStyle.link, url=painel.link_meet))
         await interaction.response.send_message(texto, view=view, ephemeral=True)
 
 
@@ -389,13 +407,17 @@ class BotaoEncerrarSessao(Button):
 
         await interaction.response.defer()
         await asyncio.to_thread(_encerrar_sessao_sync, painel.sala)
+        evento_id = await asyncio.to_thread(_buscar_evento_id_sync, painel.sala)
+        if evento_id:
+            await google_meet.excluir_reuniao(evento_id)
         painel._montar_conteudo(encerrada=True)
         await interaction.message.edit(view=painel)
 
 
 class PainelTela(LayoutView):
     def __init__(self, cog: "Tela", guild: discord.Guild, sala: str, codigo: str,
-                 adm_id: int, alvo: discord.Member = None, cor: int = COR_PADRAO):
+                 adm_id: int, alvo: discord.Member = None, cor: int = COR_PADRAO,
+                 link_meet: str = None):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
@@ -405,6 +427,7 @@ class PainelTela(LayoutView):
         self.alvo = alvo
         self.alvo_id = alvo.id if alvo else None
         self.cor = cor
+        self.link_meet = link_meet
 
         self.container = Container(accent_color=discord.Color(cor))
         self._montar_conteudo()  # já adiciona self.container à view (necessário pro re-render no encerrar)
@@ -414,31 +437,25 @@ class PainelTela(LayoutView):
         self.clear_items()
 
         icone_url = self.guild.icon.url if self.guild.icon else None
-
-        if encerrada:
-            if icone_url:
-                secao = Section(TextDisplay("## Verificação de Tela"), accessory=Thumbnail(icone_url))
-                self.container.add_item(secao)
-            else:
-                self.container.add_item(TextDisplay("## Verificação de Tela"))
-            self.container.add_item(Separator())
-            self.container.add_item(TextDisplay("**Status:** 🔴 sala encerrada."))
-            self.add_item(self.container)
-            return
-
-        titulo = TextDisplay("## Verificação de Tela")
+        titulo = TextDisplay(f"## {EMOJI_CALL} Verificação de Tela")
         if icone_url:
             self.container.add_item(Section(titulo, accessory=Thumbnail(icone_url)))
         else:
             self.container.add_item(titulo)
         self.container.add_item(Separator())
 
-        alvo_linha = f"**Alvo:** {self.alvo.mention}" if self.alvo else "**Tipo:** sala aberta"
+        if encerrada:
+            self.container.add_item(TextDisplay(f"**Status:** {EMOJI_STATUS_ENCERRADA} sala encerrada"))
+            self.add_item(self.container)
+            return
+
+        alvo_linha = (f"{EMOJI_ALVO} **Alvo:** {self.alvo.mention}" if self.alvo
+                       else f"{EMOJI_ALVO} **Tipo:** sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
-            f"**Status:** 🟢 sala ativa (sem limite de tempo)\n\n"
-            f"**Código para espectadores:** `{self.codigo}`\n"
-            f"-# Divulgue esse código pra galera assistir pelo painel de #ver-tela."
+            f"{EMOJI_STATUS_ATIVA} **Status:** ativa · encerra sozinha em {DURACAO_CALL_MINUTOS}min\n"
+            f"{EMOJI_CODIGO} **Código de espectador:** `{self.codigo}`\n\n"
+            f"-# Divulgue o código pra galera assistir pelo painel de #ver-tela."
         ))
         self.container.add_item(Separator())
 
@@ -529,14 +546,22 @@ class Tela(commands.Cog):
                 sala = f"ffz-{ctx.guild.id}-{random.randint(100000, 999999)}"
                 codigo = await asyncio.to_thread(_gerar_codigo_unico_sync)
 
+                titulo_reuniao = f"Verificação de Tela — {ctx.guild.name} — {codigo}"
+                link_meet, evento_id = await google_meet.criar_reuniao(
+                    titulo_reuniao, minutos_duracao=DURACAO_CALL_MINUTOS
+                )
+
                 await asyncio.to_thread(
                     _salvar_sessao_sync, sala, codigo, ctx.guild.id, ctx.author.id,
-                    alvo.id if alvo else None,
+                    alvo.id if alvo else None, link_meet, evento_id,
                 )
 
                 cor = await _cor_da_guild(ctx.guild.id)
-                painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor)
+                painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor, link_meet)
                 await ctx.send(view=painel)
+            except RuntimeError as e:
+                # normalmente é falta de variável de ambiente do Google
+                return await ctx.send(f"❌ {e}", delete_after=30)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
