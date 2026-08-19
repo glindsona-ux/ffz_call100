@@ -409,7 +409,7 @@ class BotaoEntrarEspectador(Button):
 
 class BotaoGerarUrl(Button):
     def __init__(self, painel: "PainelTela"):
-        super().__init__(label="Pegar link da call", emoji=EMOJIS['link'],
+        super().__init__(label="Link da Call", emoji=EMOJIS['link'],
                           style=discord.ButtonStyle.primary, row=0)
         self.painel = painel
 
@@ -441,7 +441,7 @@ class BotaoGerarUrl(Button):
 
 class BotaoDeixarPublico(Button):
     def __init__(self, painel: "PainelTela"):
-        super().__init__(label="Deixar Público", emoji="🔓", style=discord.ButtonStyle.secondary, row=0)
+        super().__init__(label="Deixar Público", style=discord.ButtonStyle.secondary, row=0)
         self.painel = painel
 
     async def callback(self, interaction: discord.Interaction):
@@ -562,8 +562,8 @@ class PainelTela(LayoutView):
             return
 
         # ---- bloco 1: quem/o quê ----
-        alvo_linha = (f"**{EMOJIS['alvo']} Jogador em análise:** {self.alvo.mention}" if self.alvo
-                       else f"**{EMOJIS['alvo']} Tipo de sessão:** Sala aberta")
+        alvo_linha = (f"**Jogador em análise:** {self.alvo.mention}" if self.alvo
+                       else "**Tipo de sessão:** Sala aberta")
         self.container.add_item(TextDisplay(
             f"{alvo_linha}\n"
             f"-# A call já está ativa no Google Meet. Use os botões abaixo para gerenciar o acesso."
@@ -571,20 +571,19 @@ class PainelTela(LayoutView):
         self.container.add_item(Separator())
 
         # ---- bloco 2: status ao vivo ----
-        status_emoji = EMOJIS['status_ativa']
         acesso_txt = "Pública — qualquer pessoa entra pelo botão abaixo" if self.publica \
             else "Privada — só o alvo e mediadores entram direto"
         self.container.add_item(TextDisplay(
-            f"{status_emoji} **Status:** Ativa · encerra sozinha em {DURACAO_CALL_MINUTOS} min\n"
-            f"{EMOJIS['escudo']} **Acesso:** {acesso_txt}\n"
-            f"{EMOJIS['call']} **Participantes na call agora:** `{self.participantes}`"
+            f"**Status:** Ativa · encerra sozinha em {DURACAO_CALL_MINUTOS} min\n"
+            f"**Acesso:** {acesso_txt}\n"
+            f"**Participantes na call agora:** `{self.participantes}`"
         ))
         self.container.add_item(Separator())
 
         # ---- bloco 3: código de espectador ----
         self.container.add_item(TextDisplay(
-            f"{EMOJIS['codigo']} **Código de acesso:** `{self.codigo}`\n"
-            f"-# {EMOJIS['espectador']} Compartilhe esse código no painel de #ver-tela para liberar "
+            f"**Código de acesso:** `{self.codigo}`\n"
+            f"-# Compartilhe esse código no painel de #ver-tela para liberar "
             f"o acesso aos espectadores."
         ))
         self.container.add_item(Separator())
