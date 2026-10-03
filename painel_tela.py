@@ -46,6 +46,7 @@ import json
 import string
 import random
 import sqlite3
+import time
 import asyncio
 
 import discord
@@ -457,6 +458,7 @@ class BotaoEncerrarSessao(Button):
             )
 
         await interaction.response.defer()
+        painel.encerrado_por = interaction.user.id
         painel.parar_atualizacao()
         await asyncio.to_thread(_encerrar_sessao_sync, painel.sala)
         evento_id = await asyncio.to_thread(_buscar_evento_id_sync, painel.sala)
@@ -496,6 +498,11 @@ class PainelTela(LayoutView):
         self.participantes: int | None = None
         self.encerrada = False
         self.message: discord.Message | None = None
+
+        # usados no visual novo do painel: horário de criação (vira timestamp
+        # relativo do Discord) e quem encerrou (preenchido pelo botão Encerrar)
+        self.criado_ts = int(time.time())
+        self.encerrado_por: int | None = None
 
         self.container = Container(accent_color=discord.Color(cor))
         self._montar_conteudo()  # já adiciona self.container à view (necessário pro re-render no encerrar)
@@ -541,60 +548,99 @@ class PainelTela(LayoutView):
                     pass
 
     def _montar_conteudo(self, encerrada=False):
+        """Layout do painel (Components V2), de cima pra baixo:
+        cabeçalho (título + ícone) > situação > como funciona > código >
+        botões > rodapé. Separadores grandes entre blocos, pra respirar."""
         self.container.clear_items()
         self.clear_items()
 
-        # Título "ANÁLISE <NOME DO SERVIDOR>" (sem emoji), com o ícone do servidor
-        # como thumbnail ao lado -- pedido depois de tirar tudo antes.
-        # Nome da org/servidor onde o painel está (em maiúsculas, igual ao
-        # visual antigo "ANÁLISE FFZ"); escape_markdown evita que um nome
-        # com * _ ~ ` quebre a formatação do título.
+        def sep():
+            # separador V2 com linha visível e respiro grande (novo a cada uso)
+            return Separator(visible=True, spacing=discord.SeparatorSpacing.large)
+
+        E = EMOJIS
+        # escape_markdown: nome com * _ ~ ` não quebra o título
         nome_org = discord.utils.escape_markdown(self.guild.name).upper()
-        titulo = TextDisplay(f"# **ANÁLISE {nome_org}**")
+
+        # ---------------- cabeçalho ----------------
+        cabecalho = TextDisplay(
+            f"# **ANÁLISE {nome_org}**\n"
+            f"-# Verificação de tela ao vivo · Google Meet"
+        )
         icone_url = self.guild.icon.url if self.guild.icon else None
         if icone_url:
-            self.container.add_item(Section(titulo, accessory=Thumbnail(icone_url)))
+            self.container.add_item(Section(cabecalho, accessory=Thumbnail(icone_url)))
         else:
-            self.container.add_item(titulo)
-        self.container.add_item(Separator())
+            self.container.add_item(cabecalho)
+        self.container.add_item(sep())
 
+        # ---------------- encerrada ----------------
         if encerrada:
-            self.container.add_item(TextDisplay("**Sessão encerrada.** Link e código não valem mais."))
+            duracao_min = max(1, (int(time.time()) - self.criado_ts) // 60)
+            quem = f" por <@{self.encerrado_por}>" if self.encerrado_por else ""
+            self.container.add_item(TextDisplay(
+                f"### {E['status_encerrada']} Sessão encerrada{quem}\n"
+                f"A análise durou cerca de **{duracao_min} min**. "
+                f"O link e o código **não valem mais**."
+            ))
+            self.container.add_item(sep())
+            self.container.add_item(TextDisplay(
+                f"-# Aberta por <@{self.adm_id}> · <t:{self.criado_ts}:f>"
+            ))
             self.add_item(self.container)
             return
 
-        # ---- bloco 1: quem/o quê (direto, sem emoji nem parágrafo longo) ----
-        alvo_linha = (f"**Alvo:** {self.alvo.mention}" if self.alvo else "**Sessão:** aberta")
-        self.container.add_item(TextDisplay(
-            f"{alvo_linha} · **pública** — qualquer pessoa entra pelo link a qualquer hora.\n"
-            f"-# No iPhone, compartilhar tela só funciona pelo app do Meet (não pelo Safari)."
-        ))
-        self.container.add_item(Separator())
-
-        # ---- bloco 2: status ao vivo ----
+        # ---------------- situação da sessão ----------------
         if self.participantes is None:
-            contador_txt = "consultando…"
+            na_call = "consultando…"
         elif self.participantes == 0:
-            contador_txt = "ninguém entrou ainda"
+            na_call = "ninguém entrou ainda"
+        elif self.participantes == 1:
+            na_call = "**1** pessoa"
         else:
-            contador_txt = f"`{self.participantes}` na call agora"
-        self.container.add_item(TextDisplay(
-            f"**Encerra em:** {DURACAO_CALL_MINUTOS} min (automático) · **Participantes:** {contador_txt}"
-        ))
-        self.container.add_item(Separator())
+            na_call = f"**{self.participantes}** pessoas"
 
-        # ---- bloco 3: código de espectador ----
-        self.container.add_item(TextDisplay(
-            f"**Código:** `{self.codigo}`\n"
-            f"-# Use em #ver-tela para liberar acesso a espectadores."
-        ))
-        self.container.add_item(Separator())
+        alvo_txt = self.alvo.mention if self.alvo else "sala aberta (sem alvo definido)"
+        fim_ts = self.criado_ts + DURACAO_CALL_MINUTOS * 60
 
-        # ---- ações: link + encerrar lado a lado ----
+        self.container.add_item(TextDisplay(
+            f"### {E['status_ativa']} Sessão ao vivo\n"
+            f"{E['alvo']} **Alvo:** {alvo_txt}\n"
+            f"{E['espectador']} **Na call:** {na_call}\n"
+            f"⏳ **Limite do Meet:** {DURACAO_CALL_MINUTOS} min com 3+ pessoas · termina <t:{fim_ts}:R>\n"
+            f"{E['link']} **Acesso:** público — quem tiver o link entra direto"
+        ))
+        self.container.add_item(sep())
+
+        # ---------------- como funciona ----------------
+        self.container.add_item(TextDisplay(
+            "### Como funciona\n"
+            "**1.** O jogador toca em **Link da Call**, entra e compartilha a tela.\n"
+            "**2.** Os espectadores entram pelo mesmo botão ou usam o código no **#ver-tela**.\n"
+            "**3.** Ao terminar, um mediador toca em **Encerrar**.\n"
+            f"-# {E['aviso']} No iPhone, o compartilhamento de tela só funciona pelo app do Google Meet "
+            "(não pelo Safari). Entre sempre com microfone e câmera desligados, se for espectador."
+        ))
+        self.container.add_item(sep())
+
+        # ---------------- código de acesso ----------------
+        self.container.add_item(TextDisplay(
+            f"### {E['codigo']} Código de acesso\n"
+            f"## `{self.codigo}`\n"
+            f"-# Informe esse código no painel do **#ver-tela** para liberar um espectador."
+        ))
+        self.container.add_item(sep())
+
+        # ---------------- ações ----------------
         row_acoes = ActionRow()
         row_acoes.add_item(BotaoGerarUrl(self))
         row_acoes.add_item(BotaoEncerrarSessao(self))
         self.container.add_item(row_acoes)
+
+        # ---------------- rodapé ----------------
+        self.container.add_item(TextDisplay(
+            f"-# Aberta por <@{self.adm_id}> · <t:{self.criado_ts}:R>"
+        ))
 
         self.add_item(self.container)
 
@@ -732,7 +778,12 @@ class Tela(commands.Cog):
                 cor = await _cor_da_guild(ctx.guild.id)
                 painel = PainelTela(self, ctx.guild, sala, codigo, ctx.author.id, alvo, cor,
                                      link_meet, nome_espaco=evento_id)
-                painel.message = await ctx.send(view=painel)
+                # só o alvo é notificado; as outras menções do painel (quem abriu,
+                # quem encerrou) aparecem clicáveis mas sem dar ping
+                painel.message = await ctx.send(
+                    view=painel,
+                    allowed_mentions=discord.AllowedMentions(users=[alvo] if alvo else False),
+                )
             except RuntimeError as e:
                 # normalmente é falta de variável de ambiente do Google
                 return await ctx.send(f"❌ {e}", delete_after=30)
