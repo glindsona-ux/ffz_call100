@@ -34,10 +34,14 @@ mudança.
 
 import os
 import asyncio
+import logging
+import concurrent.futures
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+
+logger = logging.getLogger("ffz.google_meet")
 
 # escopo da Meet API -- "cria, edita e vê info das salas criadas pelo app".
 # Precisa ser autorizado de novo com setup_oauth.py (o token antigo, que só
@@ -45,6 +49,61 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/meetings.space.created"]
 
 _service = None  # cache do client autenticado, montado na primeira chamada
+
+# FIX (bot inteiro caindo de hora em hora): as chamadas HTTP daqui passam
+# pelo `httplib2`, usado por baixo dos panos pelo google-api-python-client.
+# Os logs mostravam o processo INTEIRO morrendo (crash fatal em C, não uma
+# exceção Python normal) bem no meio de uma chamada httplib2/http.client --
+# ou seja, um segfault dentro dessa lib (provavelmente por incompatibilidade
+# com a versão do Python rodando no Discloud). Rodar isso numa THREAD (como
+# era antes, via asyncio.to_thread) não protege contra isso: um crash fatal
+# em qualquer thread mata o processo inteiro, já que threads compartilham o
+# mesmo processo.
+#
+# A defesa real é rodar essas chamadas num PROCESSO separado: se esse
+# processo-filho morrer, o ProcessPoolExecutor detecta (BrokenProcessPool),
+# a gente vira isso numa exceção Python normal (RuntimeError) e o pool sobe
+# um processo novo sozinho pra próxima chamada -- o bot principal nunca
+# encosta na causa do crash e continua rodando.
+_pool: concurrent.futures.ProcessPoolExecutor | None = None
+
+# MARCA DE DIAGNÓSTICO -- não é parte da lógica, é só pra confirmar nos logs
+# se ESTE arquivo (com isolamento por processo) é o que está realmente
+# rodando no Discloud depois de um deploy. Procure por essa linha logo
+# depois de "INICIANDO BOT" nos logs: se ela não aparecer, o deploy não
+# pegou o arquivo novo (cache de build / path errado / bot não reiniciou).
+logger.warning("[google_meet] build carregado: ISOLAMENTO-POR-PROCESSO-v1")
+
+
+def _get_pool() -> concurrent.futures.ProcessPoolExecutor:
+    global _pool
+    if _pool is None:
+        _pool = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+    return _pool
+
+
+async def _rodar_isolado(func, *args, timeout: float = 20.0):
+    """Roda `func(*args)` num processo separado, com timeout. Nunca deixa
+    um crash ou travamento do lado do Google derrubar o bot -- na pior das
+    hipóteses, levanta RuntimeError/TimeoutError, que quem chamou já trata."""
+    global _pool
+    loop = asyncio.get_running_loop()
+    pool = _get_pool()
+    logger.info(f"[google_meet] chamando {func.__name__} via processo isolado (pid do pool ainda não conhecido até o worker subir)")
+    try:
+        future = loop.run_in_executor(pool, func, *args)
+        return await asyncio.wait_for(future, timeout=timeout)
+    except concurrent.futures.process.BrokenProcessPool:
+        logger.error(
+            "[google_meet] processo isolado morreu (provável crash fatal na "
+            "chamada Google/httplib2) -- recriando o pool e propagando erro "
+            "normal em vez de derrubar o bot."
+        )
+        _pool = None  # descarta o pool quebrado, o próximo _get_pool() cria um novo
+        raise RuntimeError("Falha de comunicação com o Google Meet (processo isolado caiu). Tente novamente.")
+    except asyncio.TimeoutError:
+        logger.warning(f"[google_meet] chamada isolada travou mais de {timeout}s, abortando.")
+        raise
 
 
 def _montar_credenciais() -> Credentials:
@@ -82,14 +141,28 @@ def _criar_reuniao_sync(titulo: str, minutos_duracao: int = 60) -> tuple[str, st
     avulsa (isso só existe quando a sala nasce de um evento do Calendar).
     Retorna (link_do_meet, nome_do_espaco), onde nome_do_espaco é tipo
     "spaces/abc123", usado depois pra encerrar a call."""
+    global _service
     service = _get_service_sync()
 
-    espaco_criado = service.spaces().create(body={
-        "config": {
-            "accessType": "OPEN",
-            "entryPointAccess": "ALL",
-        }
-    }).execute()
+    try:
+        espaco_criado = service.spaces().create(body={
+            "config": {
+                "accessType": "OPEN",
+                "entryPointAccess": "ALL",
+            }
+        }).execute(num_retries=3)
+    except Exception:
+        # conexão keep-alive pode ter caído (BrokenPipe/SSLError) depois de
+        # um tempo ocioso -- derruba o client cacheado pra forçar uma
+        # conexão nova na próxima chamada, e tenta de novo uma vez agora
+        _service = None
+        service = _get_service_sync()
+        espaco_criado = service.spaces().create(body={
+            "config": {
+                "accessType": "OPEN",
+                "entryPointAccess": "ALL",
+            }
+        }).execute(num_retries=3)
 
     link = espaco_criado.get("meetingUri")
     nome_espaco = espaco_criado.get("name")
@@ -111,18 +184,25 @@ def _excluir_reuniao_sync(nome_espaco: str):
 
 
 async def criar_reuniao(titulo: str, minutos_duracao: int = 60) -> tuple[str, str]:
-    """Versão async (roda o client síncrono do Google numa thread)."""
-    return await asyncio.to_thread(_criar_reuniao_sync, titulo, minutos_duracao)
+    """Versão async (roda o client síncrono do Google num processo isolado --
+    ver comentário grande em _rodar_isolado sobre o porquê de não ser mais
+    uma thread)."""
+    return await _rodar_isolado(_criar_reuniao_sync, titulo, minutos_duracao)
 
 
 async def excluir_reuniao(evento_id: str):
-    await asyncio.to_thread(_excluir_reuniao_sync, evento_id)
+    await _rodar_isolado(_excluir_reuniao_sync, evento_id)
 
 
-def _contar_participantes_sync(nome_espaco: str) -> int:
-    """Quantas pessoas estão dentro da call agora. Devolve 0 se ninguém
-    entrou ainda ou se a última conferência da sala já acabou -- nunca
-    estoura erro pro painel (só devolve 0 se a consulta falhar)."""
+def _contar_participantes_sync(nome_espaco: str) -> int | None:
+    """Quantas pessoas estão dentro da call agora. Devolve 0 se a consulta
+    funcionou e realmente não tem ninguém (ninguém entrou ainda, ou a
+    conferência mais recente já acabou). Devolve None se a CONSULTA em si
+    falhou (erro de rede/API) -- antes isso também virava 0, o que mostrava
+    "Ninguém na call" no painel mesmo quando o problema era só a consulta
+    ter falhado, não a call estar vazia de verdade. Quem exibe (painel_tela)
+    trata None como "não foi possível confirmar agora" em vez de 0.
+    """
     service = _get_service_sync()
     try:
         registros = service.conferenceRecords().list(
@@ -141,8 +221,15 @@ def _contar_participantes_sync(nome_espaco: str) -> int:
         ).execute()
         return len(participantes.get("participants", []))
     except Exception:
-        return 0
+        return None
 
 
-async def contar_participantes(nome_espaco: str) -> int:
-    return await asyncio.to_thread(_contar_participantes_sync, nome_espaco)
+async def contar_participantes(nome_espaco: str) -> int | None:
+    # Essa é chamada com frequência (painel_tela atualiza o contador),
+    # então aqui a gente NÃO deixa RuntimeError/TimeoutError subir --
+    # devolve None (quem exibe já trata None como "não deu pra confirmar
+    # agora"), pra um Google instável não gerar erro repetido no painel.
+    try:
+        return await _rodar_isolado(_contar_participantes_sync, nome_espaco)
+    except (RuntimeError, asyncio.TimeoutError):
+        return None

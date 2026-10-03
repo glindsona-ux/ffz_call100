@@ -3,6 +3,8 @@ import asyncio
 import discord
 from discord.ext import commands
 
+from keep_alive import keep_alive
+
 intents = discord.Intents.default()
 intents.message_content = True  # necessário pra ler comando de prefixo (!t, !tela)
 intents.members = True          # necessário pra resolver @menção de membro
@@ -36,4 +38,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    keep_alive()  # sobe o servidor web (Render/UptimeRobot) antes do bot
     asyncio.run(main())

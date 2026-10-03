@@ -1,4 +1,5 @@
-Discord.py
+discord.py
+flask
 google-api-python-client
 google-auth
 google-auth-oauthlib
