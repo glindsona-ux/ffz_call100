@@ -11,6 +11,23 @@ intents.members = True          # necessário pra resolver @menção de membro
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+EXTENSOES = ("painel_tela", "avatar_manager")
+
+
+async def _setup_hook():
+    # carrega os módulos e registra os slash commands (/avatarbot) no Discord.
+    # O sync global pode levar um tempo pra aparecer em todos os servidores.
+    for ext in EXTENSOES:
+        await bot.load_extension(ext)
+    try:
+        sincronizados = await bot.tree.sync()
+        print(f"Slash commands sincronizados: {[c.name for c in sincronizados]}")
+    except discord.HTTPException as e:
+        print(f"Falha ao sincronizar slash commands: {e}")
+
+
+bot.setup_hook = _setup_hook
+
 
 @bot.event
 async def on_ready():
@@ -33,7 +50,6 @@ async def on_command_error(ctx, error):
 
 async def main():
     async with bot:
-        await bot.load_extension("painel_tela")
         await bot.start(os.getenv("DISCORD_TOKEN"))
 
 
