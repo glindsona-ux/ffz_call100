@@ -46,6 +46,7 @@ import json
 import string
 import random
 import sqlite3
+import re
 import time
 import asyncio
 
@@ -476,6 +477,20 @@ INTERVALO_CONTADOR_SEGUNDOS = 25
 LIMITE_LOOP_MINUTOS = DURACAO_CALL_MINUTOS + 15
 
 
+# Tira emojis do nome do servidor (o título do painel fica limpo mesmo que o
+# nome da org tenha 💎 etc.). Cobre os blocos de emoji mais comuns.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+    "\U00002300-\U000023FF\U0001F1E6-\U0001F1FF\u200d\ufe0f]+"
+)
+
+
+def _nome_limpo(nome: str) -> str:
+    limpo = _EMOJI_RE.sub("", nome)
+    limpo = re.sub(r"\s+", " ", limpo).strip(" |-–—•·")
+    return limpo or nome
+
+
 class PainelTela(LayoutView):
     def __init__(self, cog: "Tela", guild: discord.Guild, sala: str, codigo: str,
                  adm_id: int, alvo: discord.Member = None, cor: int = COR_PADRAO,
@@ -548,24 +563,20 @@ class PainelTela(LayoutView):
                     pass
 
     def _montar_conteudo(self, encerrada=False):
-        """Layout do painel (Components V2), de cima pra baixo:
-        cabeçalho (título + ícone) > situação > como funciona > código >
-        botões > rodapé. Separadores grandes entre blocos, pra respirar."""
+        """Layout enxuto (Components V2): título > dados > botões.
+        Sem emojis; só o essencial pra quem está operando a análise."""
         self.container.clear_items()
         self.clear_items()
 
         def sep():
-            # separador V2 com linha visível e respiro grande (novo a cada uso)
-            return Separator(visible=True, spacing=discord.SeparatorSpacing.large)
+            return Separator(visible=True, spacing=discord.SeparatorSpacing.small)
 
-        E = EMOJIS
-        # escape_markdown: nome com * _ ~ ` não quebra o título
-        nome_org = discord.utils.escape_markdown(self.guild.name).upper()
-
-        # ---------------- cabeçalho ----------------
+        # nome da org sem emoji e com markdown escapado; ## (e não #) pra
+        # nomes longos não ocuparem meia tela
+        nome_org = discord.utils.escape_markdown(_nome_limpo(self.guild.name)).upper()
         cabecalho = TextDisplay(
-            f"# **ANÁLISE {nome_org}**\n"
-            f"-# Verificação de tela ao vivo · Google Meet"
+            f"## **ANÁLISE {nome_org}**\n"
+            f"-# Aberta por <@{self.adm_id}> · Google Meet"
         )
         icone_url = self.guild.icon.url if self.guild.icon else None
         if icone_url:
@@ -574,73 +585,38 @@ class PainelTela(LayoutView):
             self.container.add_item(cabecalho)
         self.container.add_item(sep())
 
-        # ---------------- encerrada ----------------
         if encerrada:
             duracao_min = max(1, (int(time.time()) - self.criado_ts) // 60)
             quem = f" por <@{self.encerrado_por}>" if self.encerrado_por else ""
             self.container.add_item(TextDisplay(
-                f"### {E['status_encerrada']} Sessão encerrada{quem}\n"
-                f"A análise durou cerca de **{duracao_min} min**. "
-                f"O link e o código **não valem mais**."
-            ))
-            self.container.add_item(sep())
-            self.container.add_item(TextDisplay(
-                f"-# Aberta por <@{self.adm_id}> · <t:{self.criado_ts}:f>"
+                f"**Sessão encerrada**{quem} · durou {duracao_min} min\n"
+                f"-# O link e o código não valem mais."
             ))
             self.add_item(self.container)
             return
 
-        # ---------------- situação da sessão ----------------
         if self.participantes is None:
             na_call = "consultando…"
         elif self.participantes == 0:
             na_call = "ninguém entrou ainda"
         elif self.participantes == 1:
-            na_call = "**1** pessoa"
+            na_call = "1 pessoa"
         else:
-            na_call = f"**{self.participantes}** pessoas"
+            na_call = f"{self.participantes} pessoas"
 
-        alvo_txt = self.alvo.mention if self.alvo else "sala aberta (sem alvo definido)"
-        fim_ts = self.criado_ts + DURACAO_CALL_MINUTOS * 60
-
+        alvo_txt = self.alvo.mention if self.alvo else "sala aberta"
         self.container.add_item(TextDisplay(
-            f"### {E['status_ativa']} Sessão ao vivo\n"
-            f"{E['alvo']} **Alvo:** {alvo_txt}\n"
-            f"{E['espectador']} **Na call:** {na_call}\n"
-            f"⏳ **Limite do Meet:** {DURACAO_CALL_MINUTOS} min com 3+ pessoas · termina <t:{fim_ts}:R>\n"
-            f"{E['link']} **Acesso:** público — quem tiver o link entra direto"
+            f"**Alvo:** {alvo_txt}\n"
+            f"**Na call:** {na_call}\n"
+            f"**Código:** `{self.codigo}`\n"
+            f"-# Espectadores usam o código no #ver-tela. No iPhone, compartilhe a tela pelo app do Meet."
         ))
         self.container.add_item(sep())
 
-        # ---------------- como funciona ----------------
-        self.container.add_item(TextDisplay(
-            "### Como funciona\n"
-            "**1.** O jogador toca em **Link da Call**, entra e compartilha a tela.\n"
-            "**2.** Os espectadores entram pelo mesmo botão ou usam o código no **#ver-tela**.\n"
-            "**3.** Ao terminar, um mediador toca em **Encerrar**.\n"
-            f"-# {E['aviso']} No iPhone, o compartilhamento de tela só funciona pelo app do Google Meet "
-            "(não pelo Safari). Entre sempre com microfone e câmera desligados, se for espectador."
-        ))
-        self.container.add_item(sep())
-
-        # ---------------- código de acesso ----------------
-        self.container.add_item(TextDisplay(
-            f"### {E['codigo']} Código de acesso\n"
-            f"## `{self.codigo}`\n"
-            f"-# Informe esse código no painel do **#ver-tela** para liberar um espectador."
-        ))
-        self.container.add_item(sep())
-
-        # ---------------- ações ----------------
         row_acoes = ActionRow()
         row_acoes.add_item(BotaoGerarUrl(self))
         row_acoes.add_item(BotaoEncerrarSessao(self))
         self.container.add_item(row_acoes)
-
-        # ---------------- rodapé ----------------
-        self.container.add_item(TextDisplay(
-            f"-# Aberta por <@{self.adm_id}> · <t:{self.criado_ts}:R>"
-        ))
 
         self.add_item(self.container)
 
